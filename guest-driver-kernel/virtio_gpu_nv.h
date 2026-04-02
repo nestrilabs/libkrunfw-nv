@@ -15,6 +15,9 @@
 
 #include <linux/types.h>
 
+/* Must match host driver AND guest userspace library version exactly */
+#define NV_DRIVER_VERSION "595.58.03"
+
 /* -------------------------------------------------------------------------
  * Virtio device and queue IDs
  * ---------------------------------------------------------------------- */
