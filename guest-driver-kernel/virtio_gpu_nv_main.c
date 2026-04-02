@@ -165,6 +165,36 @@ static int nv_proc_gpu_power_show(struct seq_file *m, void *v)
   return 0;
 }
 
+static int nv_proc_mig_config_show(struct seq_file *m, void *v)
+{
+  seq_puts(m,
+           "DeviceFileMinor: 1\n"
+           "DeviceFileMode: 256\n"
+           "DeviceFileModify: 1\n"
+  );
+  return 0;
+}
+
+static int nv_proc_mig_monitor_show(struct seq_file *m, void *v)
+{
+  seq_puts(m,
+           "DeviceFileMinor: 2\n"
+           "DeviceFileMode: 292\n"
+           "DeviceFileModify: 1\n"
+  );
+  return 0;
+}
+
+static int nv_proc_fabric_imex_show(struct seq_file *m, void *v)
+{
+  seq_puts(m,
+           "DeviceFileMinor: 0\n"
+           "DeviceFileMode: 256\n"
+           "DeviceFileModify: 1\n"
+  );
+  return 0;
+}
+
 static int nv_proc_create(void)
 {
   /* /proc/driver/nvidia/ */
@@ -203,6 +233,36 @@ static int nv_proc_create(void)
   if (!proc_create_single("power", 0444, nv_proc_gpu0,
     nv_proc_gpu_power_show))
     goto err;
+
+  /* /proc/driver/nvidia/capabilities/ */
+  struct proc_dir_entry *caps, *caps_mig, *caps_gpu0, *caps_gpu0_mig;
+
+  caps = proc_mkdir("capabilities", nv_proc_nvidia);
+  if (!caps)
+    goto err;
+
+  /* /proc/driver/nvidia/capabilities/mig/{config,monitor} */
+  caps_mig = proc_mkdir("mig", caps);
+  if (!caps_mig)
+    goto err;
+
+  if (!proc_create_single("config", 0444, caps_mig,
+    nv_proc_mig_config_show))
+    goto err;
+
+  if (!proc_create_single("monitor", 0444, caps_mig,
+    nv_proc_mig_monitor_show))
+    goto err;
+
+  /* /proc/driver/nvidia/capabilities/fabric-imex-mgmt */
+  if (!proc_create_single("fabric-imex-mgmt", 0444, caps,
+    nv_proc_fabric_imex_show))
+    goto err;
+
+  /* /proc/driver/nvidia/capabilities/gpu0/mig/ (empty dir) */
+  caps_gpu0 = proc_mkdir("gpu0", caps);
+  if (caps_gpu0)
+    caps_gpu0_mig = proc_mkdir("mig", caps_gpu0);
 
   return 0;
 
