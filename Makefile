@@ -90,6 +90,11 @@ $(KERNEL_TARBALL):
 $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
 	for patch in $(KERNEL_PATCHES); do patch -p1 -d $(KERNEL_SOURCES) < "$$patch"; done
+	# --- gpu-nv guest driver ---
+	cp -r guest-driver-kernel $(KERNEL_SOURCES)/drivers/virtio/gpu_nv
+	@echo 'source "drivers/virtio/gpu_nv/Kconfig"' >> $(KERNEL_SOURCES)/drivers/virtio/Kconfig
+	@echo 'obj-y += gpu_nv/' >> $(KERNEL_SOURCES)/drivers/virtio/Makefile
+	# --- end gpu-nv ---
 	cp config-libkrunfw$(VARIANT)_$(GUESTARCH) $(KERNEL_SOURCES)/.config
 	cd $(KERNEL_SOURCES) ; $(MAKE) olddefconfig
 

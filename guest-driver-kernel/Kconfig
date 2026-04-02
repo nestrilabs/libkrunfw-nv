@@ -1,0 +1,9 @@
+config VIRTIO_GPU_NV
+	bool "Virtio GPU NV (NVIDIA ioctl proxy)"
+	depends on VIRTIO
+	default y
+	help
+	  Virtio device driver that proxies NVIDIA GPU ioctls
+	  to the host via the virtio-gpu-nv backend device.
+	  This allows unmodified NVIDIA userspace libraries to
+	  run inside a microVM.
