@@ -43,6 +43,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/poll.h>
+#include <linux/file.h>
 
 #include "virtio_gpu_nv.h"
 #include "virtio_gpu_nv_priv.h"
@@ -334,6 +335,142 @@ out:
 }
 
 /* -------------------------------------------------------------------------
+ * guest_fd_to_handle — translate a guest fd to its backend handle
+ *
+ * Used for fd-carrying ioctls where userspace embeds a raw fd number
+ * referring to another /dev/nvidia* device.
+ * ---------------------------------------------------------------------- */
+
+extern const struct file_operations nv_fops;
+
+static int guest_fd_to_handle(int guest_fd, u64 *out_handle)
+{
+  struct file *f;
+  struct nv_file_ctx *ctx;
+
+  f = fget(guest_fd);
+  if (!f)
+    return -EBADF;
+
+  /* Verify it's one of our devices */
+  if (f->f_op != &nv_fops) {
+    fput(f);
+    return -EINVAL;
+  }
+
+  ctx = f->private_data;
+  *out_handle = ctx->guest_handle;
+  fput(f);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * nv_ioctl_fd_carrying — handle ioctls with embedded fd numbers
+ *
+ * NV_ESC_REGISTER_FD:   fd at offset 0 (4 bytes total)
+ * NV_ESC_ALLOC_OS_EVENT: fd at offset 8 (16 bytes total)
+ * NV_ESC_FREE_OS_EVENT:  fd at offset 8 (16 bytes total)
+ * ---------------------------------------------------------------------- */
+
+static long nv_ioctl_fd_carrying(struct file *filp, unsigned int cmd,
+                                 unsigned long arg, unsigned int fd_offset)
+{
+  struct nv_file_ctx *ctx = filp->private_data;
+  struct nv_dev *ndev = ctx->dev;
+  unsigned int param_size = _IOC_SIZE(cmd);
+  void __user *uarg = (void __user *)arg;
+
+  struct {
+    struct msg_header req_hdr;
+    struct ioctl_req ioctl_hdr;
+  } req;
+
+  struct nv_request resp;
+  struct ioctl_resp *iresp;
+  void *param_buf = NULL;
+  int orig_fd;
+  u64 handle;
+  long ret;
+
+  resp.resp_payload = NULL;
+
+  if (param_size > NV_MAX_PARAM_SIZE || param_size < fd_offset + 4)
+    return -EINVAL;
+
+  param_buf = kmalloc(param_size, GFP_KERNEL);
+  if (!param_buf)
+    return -ENOMEM;
+
+  if (copy_from_user(param_buf, uarg, param_size)) {
+    ret = -EFAULT;
+    goto out;
+  }
+
+  /* Read the embedded fd number */
+  memcpy(&orig_fd, param_buf + fd_offset, sizeof(int));
+
+  /* Translate fd → guest_handle */
+  ret = guest_fd_to_handle(orig_fd, &handle);
+  if (ret) {
+    pr_err("nv_ioctl_fd_carrying: bad embedded fd %d: %ld\n", orig_fd, ret);
+    goto out;
+  }
+
+  /* Replace fd with guest_handle (backend will translate to host fd) */
+  {
+    u32 handle32 = (u32)handle;
+    memcpy(param_buf + fd_offset, &handle32, sizeof(u32));
+  }
+
+  /* Send request */
+  req.req_hdr.msg_type = cpu_to_le32(NV_MSG_IOCTL);
+  req.req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
+  req.req_hdr._pad = 0;
+
+  req.ioctl_hdr.guest_handle = cpu_to_le64(ctx->guest_handle);
+  req.ioctl_hdr.request = cpu_to_le64((u64)cmd);
+  req.ioctl_hdr.param_size = cpu_to_le32(param_size);
+  req.ioctl_hdr._pad = 0;
+
+  ret = nv_do_request(ndev, &req, sizeof(req), param_buf, param_size, &resp);
+  if (ret)
+    goto out;
+
+  if (le32_to_cpu(resp.resp_hdr.status) != NV_STATUS_OK) {
+    int host_errno = le32_to_cpu(resp.resp_hdr.errno_host);
+    ret = host_errno ? -host_errno : -EIO;
+    goto out;
+  }
+
+  if (resp.resp_payload_len < sizeof(struct ioctl_resp)) {
+    ret = -EIO;
+    goto out;
+  }
+
+  iresp = (struct ioctl_resp *)resp.resp_payload;
+
+  if (param_size && iresp->param_size) {
+    u32 copy_len = min_t(u32, param_size, le32_to_cpu(iresp->param_size));
+    void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
+
+    /* Restore original fd before copying back to userspace */
+    if (copy_len >= fd_offset + 4)
+      memcpy(resp_params + fd_offset, &orig_fd, sizeof(int));
+
+    if (copy_to_user(uarg, resp_params, copy_len)) {
+      ret = -EFAULT;
+      goto out;
+    }
+  }
+
+  ret = 0;
+out:
+  kfree(resp.resp_payload);
+  kfree(param_buf);
+  return ret;
+}
+
+/* -------------------------------------------------------------------------
  * nv_ioctl — main dispatch
  * ---------------------------------------------------------------------- */
 
@@ -342,18 +479,20 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
   /* Ioctls with embedded userspace pointers need special handling */
   switch (escape) {
-  case 0x2A: /* NV_ESC_RM_CONTROL */
-    return nv_ioctl_nested(filp, cmd, arg,
-                           RMCTL_OUTER_SIZE,
-                           RMCTL_PTR_OFFSET,
-                           RMCTL_SIZE_OFFSET);
-  case 0x2B: /* NV_ESC_RM_ALLOC */
-    return nv_ioctl_nested(filp, cmd, arg,
-                           RMALLOC_OUTER_SIZE,
-                           RMALLOC_PTR_OFFSET,
-                           RMALLOC_SIZE_OFFSET);
-  default:
-    break;
+    case 0x2A: /* NV_ESC_RM_CONTROL */
+      return nv_ioctl_nested(filp, cmd, arg,
+                             RMCTL_OUTER_SIZE, RMCTL_PTR_OFFSET, RMCTL_SIZE_OFFSET);
+    case 0x2B: /* NV_ESC_RM_ALLOC */
+      return nv_ioctl_nested(filp, cmd, arg,
+                             RMALLOC_OUTER_SIZE, RMALLOC_PTR_OFFSET, RMALLOC_SIZE_OFFSET);
+    case 0xC9: /* NV_ESC_REGISTER_FD */
+      return nv_ioctl_fd_carrying(filp, cmd, arg, 0);
+    case 0xCE: /* NV_ESC_ALLOC_OS_EVENT */
+      return nv_ioctl_fd_carrying(filp, cmd, arg, 8);
+    case 0xCF: /* NV_ESC_FREE_OS_EVENT */
+      return nv_ioctl_fd_carrying(filp, cmd, arg, 8);
+    default:
+      break;
   }
 
   /* Original path for simple ioctls (no embedded pointers) */
