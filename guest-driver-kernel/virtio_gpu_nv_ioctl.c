@@ -164,53 +164,122 @@ static int nv_release(struct inode *inode, struct file *filp) {
 }
 
 /* -------------------------------------------------------------------------
- * nv_ioctl — forward raw ioctl bytes to the backend
+ * NVOS54_PARAMETERS layout (NV_ESC_RM_CONTROL, escape 0x2A)
+ *   offset  0: hClient       u32
+ *   offset  4: hObject       u32
+ *   offset  8: cmd           u32
+ *   offset 12: flags         u32
+ *   offset 16: params        u64  ← USERSPACE POINTER
+ *   offset 24: paramsSize    u32
+ *   offset 28: status        u32
+ *   total: 32 bytes
  *
- * Size source: _IOC_SIZE(cmd) — the size encoded by the user-mode library
- * in the ioctl number.  See the file-level comment for why this is correct.
+ * NVOS64_PARAMETERS layout (NV_ESC_RM_ALLOC, escape 0x2B)
+ *   offset  0: hRoot         u32
+ *   offset  4: hObjectParent u32
+ *   offset  8: hObjectNew    u32
+ *   offset 12: hClass        u32
+ *   offset 16: pAllocParms   u64  ← USERSPACE POINTER
+ *   offset 24: pRightsReq    u64  ← USERSPACE POINTER (handled as NULL for now)
+ *   offset 32: paramsSize    u32
+ *   offset 36: flags         u32
+ *   offset 40: status        u32
+ *   offset 44: _pad          u32
+ *   total: 48 bytes
  * ---------------------------------------------------------------------- */
 
-long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+#define RMCTL_OUTER_SIZE       32
+#define RMCTL_PTR_OFFSET       16
+#define RMCTL_SIZE_OFFSET      24
+
+#define RMALLOC_OUTER_SIZE     48
+#define RMALLOC_PTR_OFFSET     16
+#define RMALLOC_SIZE_OFFSET    32
+
+/*
+ * nv_ioctl_nested — handle ioctls with embedded userspace pointers.
+ *
+ * Copies both the outer struct and the nested param buffer from guest
+ * userspace, sends them concatenated (outer + nested) to the backend.
+ * On response, copies both back to guest userspace.
+ */
+static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
+                            unsigned long arg, unsigned int outer_size,
+                            unsigned int ptr_offset,
+                            unsigned int size_offset)
+{
   struct nv_file_ctx *ctx = filp->private_data;
   struct nv_dev *ndev = ctx->dev;
-  unsigned int param_size = _IOC_SIZE(cmd);
+  void __user *uarg = (void __user *)arg;
+
+  u8 outer[48]; /* big enough for both NVOS54 and NVOS64 */
+  u64 user_ptr;
+  u32 nested_size;
+  void *nested_buf = NULL;
+  void *combined = NULL;
+  u32 total_size;
 
   struct {
     struct msg_header req_hdr;
     struct ioctl_req ioctl_hdr;
   } req;
-
   struct nv_request resp;
   struct ioctl_resp *iresp;
-  void *param_buf = NULL;
   long ret;
 
   resp.resp_payload = NULL;
 
-  if (param_size > NV_MAX_PARAM_SIZE)
+  if (outer_size > sizeof(outer))
     return -EINVAL;
 
-  if (param_size) {
-    param_buf = kmalloc(param_size, GFP_KERNEL);
-    if (!param_buf)
+  if (copy_from_user(outer, uarg, outer_size))
+    return -EFAULT;
+
+  /* Extract embedded pointer and nested param size */
+  memcpy(&user_ptr, &outer[ptr_offset], sizeof(u64));
+  memcpy(&nested_size, &outer[size_offset], sizeof(u32));
+
+  /* Copy nested params from guest userspace if present */
+  if (user_ptr && nested_size > 0) {
+    if (nested_size > NV_MAX_PARAM_SIZE - outer_size)
+      return -EINVAL;
+
+    nested_buf = kmalloc(nested_size, GFP_KERNEL);
+    if (!nested_buf)
       return -ENOMEM;
 
-    if (copy_from_user(param_buf, (void __user *)arg, param_size)) {
+    if (copy_from_user(nested_buf, (void __user *)user_ptr, nested_size)) {
       ret = -EFAULT;
       goto out;
     }
   }
 
+  /* Zero the pointer — backend will set its own host pointer */
+  memset(&outer[ptr_offset], 0, sizeof(u64));
+
+  /* Build combined buffer: outer + nested */
+  total_size = outer_size + (nested_buf ? nested_size : 0);
+  combined = kmalloc(total_size, GFP_KERNEL);
+  if (!combined) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  memcpy(combined, outer, outer_size);
+  if (nested_buf)
+    memcpy(combined + outer_size, nested_buf, nested_size);
+
+  /* Send request */
   req.req_hdr.msg_type = cpu_to_le32(NV_MSG_IOCTL);
   req.req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
   req.req_hdr._pad = 0;
 
   req.ioctl_hdr.guest_handle = cpu_to_le64(ctx->guest_handle);
   req.ioctl_hdr.request = cpu_to_le64((u64)cmd);
-  req.ioctl_hdr.param_size = cpu_to_le32(param_size);
+  req.ioctl_hdr.param_size = cpu_to_le32(total_size);
   req.ioctl_hdr._pad = 0;
 
-  ret = nv_do_request(ndev, &req, sizeof(req), param_buf, param_size, &resp);
+  ret = nv_do_request(ndev, &req, sizeof(req), combined, total_size, &resp);
   if (ret)
     goto out;
 
@@ -227,37 +296,152 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
   iresp = (struct ioctl_resp *)resp.resp_payload;
 
-  if (param_size && iresp->param_size) {
-    u32 copy_len = min_t(u32, param_size, le32_to_cpu(iresp->param_size));
+  /* Copy results back to guest userspace */
+  {
     void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
+    u32 resp_total = le32_to_cpu(iresp->param_size);
 
-    if (copy_to_user((void __user *)arg, resp_params, copy_len)) {
-      ret = -EFAULT;
-      goto out;
-    }
-  }
+    if (resp_total >= outer_size) {
+      /* Restore original userspace pointer before copying outer back */
+      memcpy(resp_params + ptr_offset, &user_ptr, sizeof(u64));
 
-  /* If the backend returned SHM mapping metadata, record it so
-   * nv_mmap() can look up the pgprot later. */
-  if (le64_to_cpu(iresp->shm_length) > 0) {
-    struct nv_mapping_info *mi = kmalloc(sizeof(*mi), GFP_KERNEL);
-    if (mi) {
-      mi->shm_offset = le64_to_cpu(iresp->shm_offset);
-      mi->shm_length = le64_to_cpu(iresp->shm_length);
-      mi->pgprot = iresp->pgprot;
-      spin_lock(&ctx->mappings_lock);
-      list_add_tail(&mi->list, &ctx->mappings);
-      spin_unlock(&ctx->mappings_lock);
-    } else {
-      pr_warn("nv_ioctl: failed to alloc nv_mapping_info\n");
+      if (copy_to_user(uarg, resp_params, outer_size)) {
+        ret = -EFAULT;
+        goto out;
+      }
+
+      /* Copy nested params back to original userspace pointer */
+      if (user_ptr && nested_size > 0) {
+        u32 resp_nested = resp_total - outer_size;
+        u32 copy_len = min_t(u32, resp_nested, nested_size);
+        if (copy_len > 0) {
+          if (copy_to_user((void __user *)user_ptr,
+                           resp_params + outer_size, copy_len)) {
+            ret = -EFAULT;
+            goto out;
+          }
+        }
+      }
     }
   }
 
   ret = 0;
 out:
   kfree(resp.resp_payload);
-  kfree(param_buf);
+  kfree(combined);
+  kfree(nested_buf);
   return ret;
+}
+
+/* -------------------------------------------------------------------------
+ * nv_ioctl — main dispatch
+ * ---------------------------------------------------------------------- */
+
+long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+  unsigned int escape = _IOC_NR(cmd);
+
+  /* Ioctls with embedded userspace pointers need special handling */
+  switch (escape) {
+  case 0x2A: /* NV_ESC_RM_CONTROL */
+    return nv_ioctl_nested(filp, cmd, arg,
+                           RMCTL_OUTER_SIZE,
+                           RMCTL_PTR_OFFSET,
+                           RMCTL_SIZE_OFFSET);
+  case 0x2B: /* NV_ESC_RM_ALLOC */
+    return nv_ioctl_nested(filp, cmd, arg,
+                           RMALLOC_OUTER_SIZE,
+                           RMALLOC_PTR_OFFSET,
+                           RMALLOC_SIZE_OFFSET);
+  default:
+    break;
+  }
+
+  /* Original path for simple ioctls (no embedded pointers) */
+  {
+    struct nv_file_ctx *ctx = filp->private_data;
+    struct nv_dev *ndev = ctx->dev;
+    unsigned int param_size = _IOC_SIZE(cmd);
+
+    struct {
+      struct msg_header req_hdr;
+      struct ioctl_req ioctl_hdr;
+    } req;
+
+    struct nv_request resp;
+    struct ioctl_resp *iresp;
+    void *param_buf = NULL;
+    long ret;
+
+    resp.resp_payload = NULL;
+
+    if (param_size > NV_MAX_PARAM_SIZE)
+      return -EINVAL;
+
+    if (param_size) {
+      param_buf = kmalloc(param_size, GFP_KERNEL);
+      if (!param_buf)
+        return -ENOMEM;
+
+      if (copy_from_user(param_buf, (void __user *)arg, param_size)) {
+        ret = -EFAULT;
+        goto out_simple;
+      }
+    }
+
+    req.req_hdr.msg_type = cpu_to_le32(NV_MSG_IOCTL);
+    req.req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
+    req.req_hdr._pad = 0;
+
+    req.ioctl_hdr.guest_handle = cpu_to_le64(ctx->guest_handle);
+    req.ioctl_hdr.request = cpu_to_le64((u64)cmd);
+    req.ioctl_hdr.param_size = cpu_to_le32(param_size);
+    req.ioctl_hdr._pad = 0;
+
+    ret = nv_do_request(ndev, &req, sizeof(req), param_buf, param_size, &resp);
+    if (ret)
+      goto out_simple;
+
+    if (le32_to_cpu(resp.resp_hdr.status) != NV_STATUS_OK) {
+      int host_errno = le32_to_cpu(resp.resp_hdr.errno_host);
+      ret = host_errno ? -host_errno : -EIO;
+      goto out_simple;
+    }
+
+    if (resp.resp_payload_len < sizeof(struct ioctl_resp)) {
+      ret = -EIO;
+      goto out_simple;
+    }
+
+    iresp = (struct ioctl_resp *)resp.resp_payload;
+
+    if (param_size && iresp->param_size) {
+      u32 copy_len = min_t(u32, param_size, le32_to_cpu(iresp->param_size));
+      void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
+
+      if (copy_to_user((void __user *)arg, resp_params, copy_len)) {
+        ret = -EFAULT;
+        goto out_simple;
+      }
+    }
+
+    if (le64_to_cpu(iresp->shm_length) > 0) {
+      struct nv_mapping_info *mi = kmalloc(sizeof(*mi), GFP_KERNEL);
+      if (mi) {
+        mi->shm_offset = le64_to_cpu(iresp->shm_offset);
+        mi->shm_length = le64_to_cpu(iresp->shm_length);
+        mi->pgprot = iresp->pgprot;
+        spin_lock(&ctx->mappings_lock);
+        list_add_tail(&mi->list, &ctx->mappings);
+        spin_unlock(&ctx->mappings_lock);
+      }
+    }
+
+    ret = 0;
+out_simple:
+    kfree(resp.resp_payload);
+    kfree(param_buf);
+    return ret;
+  }
 }
 
 /* -------------------------------------------------------------------------
