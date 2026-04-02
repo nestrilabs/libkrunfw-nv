@@ -338,6 +338,7 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
   u8 outer[48]; /* big enough for both NVOS54 and NVOS64 */
   u64 user_ptr;
   u32 nested_size;
+  u32 copy_size;   /* how many bytes we actually copy from userspace */
   void *nested_buf = NULL;
   void *combined = NULL;
   u32 total_size;
@@ -363,56 +364,52 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
   memcpy(&nested_size, &outer[size_offset], sizeof(u32));
 
   /*
-   * Handle paramsSize==0 with non-null pointer.
+   * Determine how many bytes to copy from guest userspace.
    *
-   * For RM_ALLOC (outer_size==48), the host kernel determines param size
-   * from hClass.  We look up the size here so we can copy the right
-   * amount from guest userspace.
-   *
-   * For RM_CONTROL (outer_size==32), paramsSize is always set by the
-   * library, so this case shouldn't arise — but the fallback is safe.
+   * If paramsSize > 0, use it directly.
+   * If paramsSize == 0 but pointer is non-null, the host kernel
+   * determines size internally (from hClass for RM_ALLOC, or cmd
+   * for RM_CONTROL).  We look up or use a default size to copy
+   * the data, but do NOT modify paramsSize — the host expects 0.
    */
-  if (user_ptr && nested_size == 0) {
+  copy_size = nested_size;
+
+  if (user_ptr && copy_size == 0) {
     if (outer_size == RMALLOC_OUTER_SIZE) {
       u32 hClass;
       memcpy(&hClass, &outer[RMALLOC_HCLASS_OFFSET], sizeof(u32));
-      nested_size = rmalloc_class_param_size(hClass);
-      if (nested_size > 0) {
-        /* Write the resolved size back into the outer struct so the
-         * backend knows how many nested bytes follow. */
-        memcpy(&outer[size_offset], &nested_size, sizeof(u32));
-        pr_debug("nv_ioctl_nested: hClass=0x%x paramsSize was 0, using %u\n",
-                 hClass, nested_size);
-      }
+      copy_size = rmalloc_class_param_size(hClass);
+      pr_debug("nv_ioctl_nested: hClass=0x%x paramsSize=0, copy_size=%u\n",
+               hClass, copy_size);
     } else {
-      /* RM_CONTROL with paramsSize==0 but non-null pointer — use fallback */
-      nested_size = 512;
-      memcpy(&outer[size_offset], &nested_size, sizeof(u32));
+      /* RM_CONTROL with paramsSize==0 but non-null pointer — fallback */
+      copy_size = 512;
       pr_warn_once("nv_ioctl_nested: RM_CONTROL paramsSize==0 with non-null ptr, using fallback %u\n",
-                   nested_size);
+                   copy_size);
     }
   }
 
   /* Copy nested params from guest userspace if present */
-  if (user_ptr && nested_size > 0) {
-    if (nested_size > NV_MAX_PARAM_SIZE - outer_size)
+  if (user_ptr && copy_size > 0) {
+    if (copy_size > NV_MAX_PARAM_SIZE - outer_size)
       return -EINVAL;
 
-    nested_buf = kmalloc(nested_size, GFP_KERNEL);
+    nested_buf = kmalloc(copy_size, GFP_KERNEL);
     if (!nested_buf)
       return -ENOMEM;
 
-    if (copy_from_user(nested_buf, (void __user *)user_ptr, nested_size)) {
+    if (copy_from_user(nested_buf, (void __user *)user_ptr, copy_size)) {
       ret = -EFAULT;
       goto out;
     }
   }
 
-  /* Zero the pointer — backend will set its own host pointer */
+  /* Zero the pointer — backend will set its own host pointer.
+   * Do NOT modify paramsSize — host kernel expects the original value. */
   memset(&outer[ptr_offset], 0, sizeof(u64));
 
   /* Build combined buffer: outer + nested */
-  total_size = outer_size + (nested_buf ? nested_size : 0);
+  total_size = outer_size + (nested_buf ? copy_size : 0);
   combined = kmalloc(total_size, GFP_KERNEL);
   if (!combined) {
     ret = -ENOMEM;
@@ -421,7 +418,7 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
 
   memcpy(combined, outer, outer_size);
   if (nested_buf)
-    memcpy(combined + outer_size, nested_buf, nested_size);
+    memcpy(combined + outer_size, nested_buf, copy_size);
 
   /* Send request */
   req.req_hdr.msg_type = cpu_to_le32(NV_MSG_IOCTL);
@@ -465,9 +462,9 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
       }
 
       /* Copy nested params back to original userspace pointer */
-      if (user_ptr && nested_size > 0) {
+      if (user_ptr && copy_size > 0) {
         u32 resp_nested = resp_total - outer_size;
-        u32 copy_len = min_t(u32, resp_nested, nested_size);
+        u32 copy_len = min_t(u32, resp_nested, copy_size);
         if (copy_len > 0) {
           if (copy_to_user((void __user *)user_ptr,
                            resp_params + outer_size, copy_len)) {
