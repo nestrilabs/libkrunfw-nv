@@ -320,59 +320,77 @@ static int nv_probe(struct virtio_device *vdev) {
     goto err_del_vqs;
   }
 
-  /* Register char devices. */
-  ndev->cdevs = kcalloc(NUM_MINORS, sizeof(*ndev->cdevs), GFP_KERNEL);
+  /* ---------- Register char devices ---------- */
+  /*
+   * We register:
+   *   major 195, minor 255        → /dev/nvidiactl
+   *   major 195, minor 0..MAX_GPU → /dev/nvidia0..N
+   *   major 237, minor 0          → /dev/nvidia-uvm
+   *
+   * Total: 1 (ctl) + MAX_GPU (gpus) + 1 (uvm) = NUM_NV_CDEVS
+   */
+  ndev->cdevs = kcalloc(NUM_NV_CDEVS, sizeof(*ndev->cdevs), GFP_KERNEL);
   if (!ndev->cdevs) {
     ret = -ENOMEM;
     goto err_free_buf;
   }
 
-  for (i = 0; i < NUM_MINORS; i++) {
-    const char *name;
-    char namebuf[32];
-    dev_t devt = MKDEV(MAJOR(nv_devt_base), MINOR(nv_devt_base) + i);
+  {
+    int idx = 0;
 
-    cdev_init(&ndev->cdevs[i].cdev, &nv_fops);
-    ndev->cdevs[i].cdev.owner = THIS_MODULE;
-    ndev->cdevs[i].minor = i;
-    ndev->cdevs[i].ndev = ndev;
+    /* Helper to register one cdev */
+#define REGISTER_CDEV(major_nr, minor_nr, dev_name, dev_kind, dev_idx)   \
+    do {                                                                      \
+      dev_t devt = MKDEV((major_nr), (minor_nr));                            \
+      cdev_init(&ndev->cdevs[idx].cdev, &nv_fops);                          \
+      ndev->cdevs[idx].cdev.owner = THIS_MODULE;                            \
+      ndev->cdevs[idx].minor = (minor_nr);                                  \
+      ndev->cdevs[idx].kind = (dev_kind);                                   \
+      ndev->cdevs[idx].gpu_index = (dev_idx);                               \
+      ndev->cdevs[idx].ndev = ndev;                                         \
+      ret = cdev_add(&ndev->cdevs[idx].cdev, devt, 1);                      \
+      if (ret) {                                                             \
+        dev_err(&vdev->dev, "cdev_add %s failed\n", (dev_name));            \
+        goto err_del_cdevs;                                                  \
+      }                                                                      \
+      ndev->cdevs[idx].device =                                              \
+      device_create(nv_class, &vdev->dev, devt, NULL, "%s", (dev_name));\
+      if (IS_ERR(ndev->cdevs[idx].device)) {                                \
+        ret = PTR_ERR(ndev->cdevs[idx].device);                             \
+        cdev_del(&ndev->cdevs[idx].cdev);                                   \
+        goto err_del_cdevs;                                                  \
+      }                                                                      \
+      idx++;                                                                 \
+    } while (0)
 
-    ret = cdev_add(&ndev->cdevs[i].cdev, devt, 1);
-    if (ret) {
-      dev_err(&vdev->dev, "cdev_add minor=%d failed\n", i);
-      goto err_del_cdevs;
+    REGISTER_CDEV(NV_MAJOR_DEVICE_NUMBER, NV_MINOR_CTL, "nvidiactl",
+                  NV_DEV_CTL, 0);
+
+    for (i = 0; i < MAX_GPU; i++) {
+      char namebuf[32];
+      snprintf(namebuf, sizeof(namebuf), "nvidia%d", i);
+      REGISTER_CDEV(NV_MAJOR_DEVICE_NUMBER, NV_MINOR_GPU_BASE + i, namebuf,
+                    NV_DEV_GPU, i);
     }
 
-    if (i == MINOR_CTL) {
-      name = "nvidiactl";
-    } else if (i == MINOR_UVM) {
-      name = "nvidia-uvm";
-    } else {
-      snprintf(namebuf, sizeof(namebuf), "nvidia%d", i - MINOR_GPU_BASE);
-      name = namebuf;
-    }
+    REGISTER_CDEV(NV_UVM_MAJOR, NV_UVM_MINOR, "nvidia-uvm",
+                  NV_DEV_UVM, 0);
 
-    ndev->cdevs[i].device =
-        device_create(nv_class, &vdev->dev, devt, NULL, "%s", name);
-    if (IS_ERR(ndev->cdevs[i].device)) {
-      ret = PTR_ERR(ndev->cdevs[i].device);
-      cdev_del(&ndev->cdevs[i].cdev);
-      goto err_del_cdevs;
-    }
+#undef REGISTER_CDEV
+
+    ndev->num_cdevs = idx;
   }
-  ndev->num_cdevs = NUM_MINORS;
 
   virtio_device_ready(vdev);
   g_nv_dev = ndev;
 
   dev_info(&vdev->dev, "virtio-gpu-nv: probed, %d devices registered\n",
-           NUM_MINORS);
+           ndev->num_cdevs);
   return 0;
 
 err_del_cdevs:
   for (i--; i >= 0; i--) {
-    device_destroy(nv_class,
-                   MKDEV(MAJOR(nv_devt_base), MINOR(nv_devt_base) + i));
+    device_destroy(nv_class, ndev->cdevs[i].cdev.dev);
     cdev_del(&ndev->cdevs[i].cdev);
   }
   kfree(ndev->cdevs);
@@ -393,12 +411,10 @@ static void nv_remove(struct virtio_device *vdev) {
   struct nv_dev *ndev = vdev->priv;
   int i;
 
-  /* Stop the device from producing more completions. */
   virtio_reset_device(vdev);
 
   for (i = 0; i < ndev->num_cdevs; i++) {
-    device_destroy(nv_class,
-                   MKDEV(MAJOR(nv_devt_base), MINOR(nv_devt_base) + i));
+    device_destroy(nv_class, ndev->cdevs[i].cdev.dev);
     cdev_del(&ndev->cdevs[i].cdev);
   }
 
@@ -407,8 +423,6 @@ static void nv_remove(struct virtio_device *vdev) {
   vdev->config->del_vqs(vdev);
   g_nv_dev = NULL;
   kfree(ndev);
-
-  dev_info(&vdev->dev, "virtio-gpu-nv: removed\n");
 }
 
 /* -------------------------------------------------------------------------
@@ -440,6 +454,10 @@ static char *gpu_nv_devnode(const struct device *dev, umode_t *mode)
   return NULL;
 }
 
+#define NV_MAJOR_DEVICE_NUMBER 195
+
+static dev_t nv_uvm_devt;
+
 static int __init nv_init(void) {
   int ret;
 
@@ -449,33 +467,42 @@ static int __init nv_init(void) {
     goto err_proc;
   }
 
-  ret = alloc_chrdev_region(&nv_devt_base, 0, NUM_MINORS, "nvidia");
+  /* Reserve major 195 minor 0..255 (covers GPUs + modeset + ctl) */
+  nv_devt_base = MKDEV(NV_MAJOR_DEVICE_NUMBER, 0);
+  ret = register_chrdev_region(nv_devt_base, 256, "nvidia");
   if (ret) {
-    pr_err("virtio-gpu-nv: alloc_chrdev_region failed: %d\n", ret);
+    pr_err("virtio-gpu-nv: register major 195 failed: %d\n", ret);
     goto err_proc;
+  }
+
+  /* Reserve major 237 minor 0..1 for UVM */
+  nv_uvm_devt = MKDEV(NV_UVM_MAJOR, 0);
+  ret = register_chrdev_region(nv_uvm_devt, 2, "nvidia-uvm");
+  if (ret) {
+    pr_err("virtio-gpu-nv: register major 237 failed: %d\n", ret);
+    goto err_unreg_195;
   }
 
   nv_class = class_create("nvidia");
   if (IS_ERR(nv_class)) {
     ret = PTR_ERR(nv_class);
-    pr_err("virtio-gpu-nv: class_create failed: %d\n", ret);
-    goto err_unregister;
+    goto err_unreg_237;
   }
   nv_class->devnode = gpu_nv_devnode;
 
   ret = register_virtio_driver(&nv_virtio_driver);
-  if (ret) {
-    pr_err("virtio-gpu-nv: register_virtio_driver failed: %d\n", ret);
+  if (ret)
     goto err_class;
-  }
 
   pr_info("virtio-gpu-nv: module loaded (driver version %s)\n", NV_DRIVER_VERSION);
   return 0;
 
 err_class:
   class_destroy(nv_class);
-err_unregister:
-  unregister_chrdev_region(nv_devt_base, NUM_MINORS);
+err_unreg_237:
+  unregister_chrdev_region(nv_uvm_devt, 2);
+err_unreg_195:
+  unregister_chrdev_region(nv_devt_base, 256);
 err_proc:
   nv_proc_destroy();
   return ret;
@@ -484,7 +511,8 @@ err_proc:
 static void __exit nv_exit(void) {
   unregister_virtio_driver(&nv_virtio_driver);
   class_destroy(nv_class);
-  unregister_chrdev_region(nv_devt_base, NUM_MINORS);
+  unregister_chrdev_region(nv_uvm_devt, 2);
+  unregister_chrdev_region(nv_devt_base, 256);
   nv_proc_destroy();
   pr_info("virtio-gpu-nv: module unloaded\n");
 }

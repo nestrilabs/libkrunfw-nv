@@ -29,7 +29,9 @@ struct nv_dev; /* forward */
 struct nv_cdev {
   struct cdev cdev;
   struct device *device;
-  int minor;           /* our minor index (see MINOR_CTL, etc.) */
+  int minor;           /* real minor number */
+  u8 kind;             /* NV_DEV_CTL, NV_DEV_GPU, or NV_DEV_UVM */
+  u8 gpu_index;        /* GPU index when kind == NV_DEV_GPU, 0 otherwise */
   struct nv_dev *ndev; /* back-pointer to parent */
 };
 
@@ -91,17 +93,23 @@ int nv_mmap(struct file *filp, struct vm_area_struct *vma);
 void nv_set_shm_bar_pfn(unsigned long pfn);
 
 /* -------------------------------------------------------------------------
- * Character device minor numbering
+ * Character device numbering — must match real NVIDIA driver
  *
- *   minor 0            → /dev/nvidiactl
- *   minor 1..MAX_GPU   → /dev/nvidia0..MAX_GPU-1
- *   minor MAX_GPU+1    → /dev/nvidia-uvm
+ *   major 195, minor 0..MAX_GPU-1  → /dev/nvidia0..nvidia(MAX_GPU-1)
+ *   major 195, minor 255           → /dev/nvidiactl
+ *   major 195, minor 254           → /dev/nvidia-modeset
+ *   major 237, minor 0             → /dev/nvidia-uvm
  * ---------------------------------------------------------------------- */
 
-#define MAX_GPU 8
-#define MINOR_CTL 0
-#define MINOR_GPU_BASE 1
-#define MINOR_UVM (MINOR_GPU_BASE + MAX_GPU)
-#define NUM_MINORS (MINOR_UVM + 1)
+#define NV_MAJOR_DEVICE_NUMBER  195
+#define MAX_GPU                 8
+#define NV_MINOR_CTL            255
+#define NV_MINOR_MODESET        254
+#define NV_MINOR_GPU_BASE       0
+
+#define NV_UVM_MAJOR            237
+#define NV_UVM_MINOR            0
+
+#define NUM_NV_CDEVS            (1 + MAX_GPU + 1)  /* ctl + gpus + uvm */
 
 #endif /* VIRTIO_GPU_NV_PRIV_H */

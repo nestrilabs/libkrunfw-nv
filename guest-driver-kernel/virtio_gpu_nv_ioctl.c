@@ -80,16 +80,8 @@ static int nv_open(struct inode *inode, struct file *filp) {
   spin_lock_init(&ctx->mappings_lock);
 
   memset(&req_payload, 0, sizeof(req_payload));
-  if (ncdev->minor == MINOR_CTL) {
-    req_payload.kind = NV_DEV_CTL;
-    req_payload.index = 0;
-  } else if (ncdev->minor == MINOR_UVM) {
-    req_payload.kind = NV_DEV_UVM;
-    req_payload.index = 0;
-  } else {
-    req_payload.kind = NV_DEV_GPU;
-    req_payload.index = (u8)(ncdev->minor - MINOR_GPU_BASE);
-  }
+  req_payload.kind = ncdev->kind;
+  req_payload.index = ncdev->gpu_index;
 
   req_hdr.msg_type = cpu_to_le32(NV_MSG_OPEN);
   req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
