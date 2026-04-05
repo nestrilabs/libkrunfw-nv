@@ -5,6 +5,9 @@ KERNEL_SOURCES = $(KERNEL_VERSION)
 KERNEL_PATCHES = $(shell find patches/ -name "0*.patch" | sort)
 KERNEL_C_BUNDLE = kernel.c
 
+# --- Track all files inside custom drivers ---
+NESTRI_DRIVERS_SRC = $(shell find guest-driver-kernel nvidia-drm-stub -type f 2>/dev/null)
+
 ABI_VERSION = 5
 FULL_VERSION = 5.3.0
 TIMESTAMP = "Tue Mar 10 13:28:56 CET 2026"
@@ -90,15 +93,22 @@ $(KERNEL_TARBALL):
 $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
 	for patch in $(KERNEL_PATCHES); do patch -p1 -d $(KERNEL_SOURCES) < "$$patch"; done
-	# --- gpu-nv guest driver ---
+	# --- Nestri drivers (Initial Copy) ---
 	cp -r guest-driver-kernel $(KERNEL_SOURCES)/drivers/virtio/gpu_nv
 	@echo 'source "drivers/virtio/gpu_nv/Kconfig"' >> $(KERNEL_SOURCES)/drivers/virtio/Kconfig
 	@echo 'obj-y += gpu_nv/' >> $(KERNEL_SOURCES)/drivers/virtio/Makefile
-	# --- end gpu-nv ---
+	cp -r nvidia-drm-stub $(KERNEL_SOURCES)/drivers/gpu/drm/nvidia-drm-stub
+	@echo 'source "drivers/gpu/drm/nvidia-drm-stub/Kconfig"' >> $(KERNEL_SOURCES)/drivers/gpu/drm/Kconfig
+	@echo 'obj-y += nvidia-drm-stub/' >> $(KERNEL_SOURCES)/drivers/gpu/drm/Makefile
+	# --- end Nestri drivers ---
 	cp config-libkrunfw$(VARIANT)_$(GUESTARCH) $(KERNEL_SOURCES)/.config
 	cd $(KERNEL_SOURCES) ; $(MAKE) olddefconfig
 
-$(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
+# --- UPDATED: Target now depends on your driver files and syncs them incrementally ---
+$(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES) $(NESTRI_DRIVERS_SRC)
+	@echo "Syncing updated drivers into the kernel tree..."
+	@rsync -a --delete guest-driver-kernel/ $(KERNEL_SOURCES)/drivers/virtio/gpu_nv/
+	@rsync -a --delete nvidia-drm-stub/ $(KERNEL_SOURCES)/drivers/gpu/drm/nvidia-drm-stub/
 	cd $(KERNEL_SOURCES) ; rm -f .version ; $(MAKE) $(MAKEFLAGS) $(KERNEL_FLAGS)
 
 ifeq ($(OS),Darwin)

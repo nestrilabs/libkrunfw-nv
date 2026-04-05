@@ -376,12 +376,36 @@ static int nv_probe(struct virtio_device *vdev) {
     REGISTER_CDEV(NV_UVM_MAJOR, NV_UVM_MINOR, "nvidia-uvm",
                   NV_DEV_UVM, 0);
 
+    REGISTER_CDEV(NV_MAJOR_DEVICE_NUMBER, NV_MINOR_MODESET, "nvidia-modeset",
+                  NV_DEV_MODESET, 0);
+
 #undef REGISTER_CDEV
 
     ndev->num_cdevs = idx;
   }
 
   virtio_device_ready(vdev);
+
+  {
+    u64 shm_bar_gpa = 0;
+    u64 shm_bar_size = 0;
+    /* NvGpuConfig: num_gpus(4) + shm_bar_gpa(8) + shm_bar_size(8) */
+    virtio_cread_bytes(vdev, 4, &shm_bar_gpa, sizeof(shm_bar_gpa));
+    shm_bar_gpa = le64_to_cpu(shm_bar_gpa);
+    virtio_cread_bytes(vdev, 12, &shm_bar_size, sizeof(shm_bar_size));
+    shm_bar_size = le64_to_cpu(shm_bar_size);
+    if (shm_bar_gpa) {
+      nv_set_shm_bar_pfn(shm_bar_gpa >> PAGE_SHIFT);
+      dev_info(&vdev->dev, "SHM BAR at GPA 0x%llx, size 0x%llx, PFN 0x%lx\n",
+               shm_bar_gpa, shm_bar_size, (unsigned long)(shm_bar_gpa >> PAGE_SHIFT));
+    } else {
+      dev_warn(&vdev->dev, "SHM BAR GPA is 0 — mmap will not work\n");
+    }
+  }
+
+  INIT_LIST_HEAD(&ndev->mappings);
+  spin_lock_init(&ndev->mappings_lock);
+
   g_nv_dev = ndev;
 
   dev_info(&vdev->dev, "virtio-gpu-nv: probed, %d devices registered\n",

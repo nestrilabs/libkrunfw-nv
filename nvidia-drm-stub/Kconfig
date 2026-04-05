@@ -1,0 +1,7 @@
+config DRM_NVIDIA_STUB
+	tristate "NVIDIA DRM stub for virtio-gpu-nv"
+	depends on DRM
+	help
+	  Minimal DRM driver that registers as "nvidia-drm" to satisfy
+	  the NVIDIA Vulkan ICD's device discovery. Used in libkrun VMs
+	  with virtio-gpu-nv GPU proxying.

@@ -59,6 +59,10 @@ struct nv_dev {
   /* Array of registered char devices. */
   struct nv_cdev *cdevs;
   int num_cdevs;
+
+  /* Global mapping list */
+  struct list_head mappings;
+  spinlock_t mappings_lock;
 };
 
 /* -------------------------------------------------------------------------
@@ -110,6 +114,6 @@ void nv_set_shm_bar_pfn(unsigned long pfn);
 #define NV_UVM_MAJOR            237
 #define NV_UVM_MINOR            0
 
-#define NUM_NV_CDEVS            (1 + MAX_GPU + 1)  /* ctl + gpus + uvm */
+#define NUM_NV_CDEVS  (1 + MAX_GPU + 1 + 1)  /* ctl + gpus + uvm + modeset */
 
 #endif /* VIRTIO_GPU_NV_PRIV_H */

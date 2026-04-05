@@ -77,8 +77,6 @@ static int nv_open(struct inode *inode, struct file *filp) {
     return -ENOMEM;
 
   ctx->dev = ndev;
-  INIT_LIST_HEAD(&ctx->mappings);
-  spin_lock_init(&ctx->mappings_lock);
 
   memset(&req_payload, 0, sizeof(req_payload));
   req_payload.kind = ncdev->kind;
@@ -147,17 +145,6 @@ static int nv_release(struct inode *inode, struct file *filp) {
     pr_warn("nv_release: backend status %u\n",
             le32_to_cpu(resp.resp_hdr.status));
 
-  /* Free any recorded mapping info. */
-  {
-    struct nv_mapping_info *mi, *tmp;
-    spin_lock(&ctx->mappings_lock);
-    list_for_each_entry_safe(mi, tmp, &ctx->mappings, list) {
-      list_del(&mi->list);
-      kfree(mi);
-    }
-    spin_unlock(&ctx->mappings_lock);
-  }
-
   kfree(resp.resp_payload);
   kfree(ctx);
   filp->private_data = NULL;
@@ -193,7 +180,7 @@ static u32 rmalloc_class_param_size(u32 hClass)
     case 0x00fb: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV50_MEMORY_VIRTUAL) */
 
     /* VASPACE */
-    case 0x90f1: return 24;  /* NV_VASPACE_ALLOCATION_PARAMETERS */
+    case 0x90f1: return 56;  /* NV_VASPACE_ALLOCATION_PARAMETERS */
 
     /* Channel group */
     case 0xa06c: return 20;  /* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS */
@@ -319,12 +306,110 @@ static u32 rmalloc_class_param_size(u32 hClass)
 #define RMALLOC_PTR_OFFSET     16
 #define RMALLOC_SIZE_OFFSET    32
 
+// Forward declare
+static int guest_fd_to_handle(int guest_fd, u64 *out_handle);
+
+/* -------------------------------------------------------------------------
+ * V1→V2 ioctl rewriting for embedded userspace pointers
+ *
+ * Many RM_CONTROL commands come in V1 (with NvP64 userspace pointer) and
+ * V2 (with inline array) variants. We intercept V1 in the guest driver
+ * and rewrite to V2 before sending to the backend. On response, we copy
+ * the inline result back to the guest's original userspace pointer.
+ *
+ * Two patterns:
+ *
+ * GET_CAPS V1: {NvU32 capsTblSize, pad(4), NvP64 capsTbl}  (16 bytes)
+ *   - userptr at offset 8, no prefix to copy into V2
+ *
+ * GET_INFO V1: {NvU32 listSize, pad(4), NvP64 list}  (16 bytes)
+ *   - userptr at offset 8, copy listSize (4 bytes) into V2 at offset 0
+ *
+ * CE GET_CAPS V1: {NvU32 ceEngineType, NvU32 capsTblSize, NvP64 capsTbl} (24 bytes)
+ *   - userptr at offset 16, copy ceEngineType (4 bytes) into V2 at offset 0
+ * ---------------------------------------------------------------------- */
+
+struct v1v2_rewrite_entry {
+    u32 v1_cmd;
+    u32 v2_cmd;
+    u32 v2_size;            /* sizeof V2 params struct */
+    u32 v1_userptr_offset;  /* offset of NvP64 in V1 nested params */
+    u32 v1_copy_prefix;     /* bytes to copy from V1 start into V2 start */
+    u32 v2_data_offset;     /* offset where result data starts in V2 */
+    u32 v2_data_size;       /* max result data bytes to copy back to guest ptr */
+};
+
+/*
+ * Note on V2 struct sizes with alignment:
+ *
+ * GR_GET_CAPS V2: {NvU8[23], pad(1), GR_ROUTE_INFO(16), NvBool(4), pad(4)} = 48
+ * GR_GET_INFO V2: {NvU32(4), GR_INFO[59](472), pad(4), GR_ROUTE_INFO(16)} = 496
+ * MSENC_GET_CAPS V2: {NvU8[6], pad(2), NvU32} = 12
+ * NVJPG_GET_CAPS V2: {NvU8[9], pad(3), NvU32} = 16
+ * CE_GET_CAPS V2: {NvU32, NvU8[2], pad(2)} = 8
+ * FB_GET_INFO V2: {NvU32(4), FB_INFO[128](1024)} = 1028
+ */
+
+static const struct v1v2_rewrite_entry v1v2_table[] = {
+    /* ---- GET_CAPS: V1 = {u32 capsTblSize, NvP64 capsTbl} ---- */
+    /*                v1_cmd      v2_cmd      v2sz  ptr_off prefix d_off d_sz */
+
+    /* FB_GET_CAPS */
+    { 0x00801301, 0x00801307,     3,     8,     0,    0,    3 },
+    /* HOST_GET_CAPS */
+    { 0x00801401, 0x00801402,     3,     8,     0,    0,    3 },
+    /* FIFO_GET_CAPS */
+    { 0x00801701, 0x00801713,     2,     8,     0,    0,    2 },
+    /* GR_GET_CAPS */
+    { 0x00801102, 0x00801109,    48,     8,     0,    0,   23 },
+    /* MSENC_GET_CAPS */
+    { 0x00801b01, 0x00801b02,    12,     8,     0,    0,    6 },
+    /* NVJPG_GET_CAPS */
+    { 0x00801f01, 0x00801f02,    16,     8,     0,    0,    9 },
+    /* BSP_GET_CAPS */
+    { 0x00801c01, 0x00801c02,     8,     8,     0,    0,    8 },
+    /* CE_GET_CAPS: V1 = {u32 ceEngineType, u32 capsTblSize, NvP64 capsTbl} */
+    { 0x20802a01, 0x20802a03,     8,    16,     4,    4,    2 },
+
+    /* ---- GET_INFO: V1 = {u32 listSize, NvP64 list} ---- */
+
+    /* GR_GET_INFO: V2 = {u32 listSize, GR_INFO[59], GR_ROUTE_INFO} */
+    { 0x00801104, 0x00801110,   496,     8,     4,    4,  472 },
+    /* FB_GET_INFO (subdevice): V2 = {u32 listSize, FB_INFO[128]} */
+    { 0x20801301, 0x20801303,  1028,     8,     4,    4, 1024 },
+    /* GR_GET_INFO (subdevice): V2 = {u32 listSize, GR_INFO[59], pad(4), GR_ROUTE_INFO(16)} */
+    { 0x20801201, 0x20801228,   496,     8,     4,    4,  472 },
+    /* GPU_GET_INFO: V2 = {u32 listSize, GPU_INFO[70]} */
+    { 0x20800101, 0x20800102,   564,     8,     4,    4,  560 },
+    /* BUS_GET_INFO: V2 = {u32 listSize, BUS_INFO[52]} */
+    { 0x20801802, 0x20801823,   420,     8,     4,    4,  416 },
+    /* BIOS_GET_INFO: V2 = {u32 listSize, BIOS_INFO[15]} */
+    { 0x20800802, 0x20800810,   124,     8,     4,    4,  120 },
+};
+
+static const struct v1v2_rewrite_entry *find_v1v2_rewrite(u32 cmd)
+{
+    int i;
+    for (i = 0; i < ARRAY_SIZE(v1v2_table); i++) {
+        if (v1v2_table[i].v1_cmd == cmd)
+            return &v1v2_table[i];
+    }
+    return NULL;
+}
+
 /*
  * nv_ioctl_nested — handle ioctls with embedded userspace pointers.
  *
  * Copies both the outer struct and the nested param buffer from guest
  * userspace, sends them concatenated (outer + nested) to the backend.
  * On response, copies both back to guest userspace.
+ *
+ * For V1 GET_CAPS/GET_INFO commands, rewrites to V2 equivalents to avoid
+ * double-nested userspace pointers.
+ *
+ * For certain RM_CONTROL commands (EXPORT_OBJECT_TO_FD, IMPORT_OBJECT_FROM_FD),
+ * the nested params contain a raw fd that must be translated to a guest_handle
+ * before sending to the backend (which then translates to a host fd).
  */
 static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
                             unsigned long arg, unsigned int outer_size,
@@ -342,6 +427,17 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
   void *nested_buf = NULL;
   void *combined = NULL;
   u32 total_size;
+
+  /* For fd-carrying RM_CONTROLs */
+  int saved_nested_fd = -1;
+  unsigned int nested_fd_offset = 0;
+
+  /* For V1→V2 rewriting */
+  const struct v1v2_rewrite_entry *rewrite = NULL;
+  u64 saved_user_ptr = 0;    /* original guest userspace data pointer */
+  u32 saved_user_data_size = 0; /* how many bytes guest expects back */
+  u32 saved_v1_cmd = 0;
+  u32 saved_v1_params_size = 0;
 
   struct {
     struct msg_header req_hdr;
@@ -363,15 +459,6 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
   memcpy(&user_ptr, &outer[ptr_offset], sizeof(u64));
   memcpy(&nested_size, &outer[size_offset], sizeof(u32));
 
-  /*
-   * Determine how many bytes to copy from guest userspace.
-   *
-   * If paramsSize > 0, use it directly.
-   * If paramsSize == 0 but pointer is non-null, the host kernel
-   * determines size internally (from hClass for RM_ALLOC, or cmd
-   * for RM_CONTROL).  We look up or use a default size to copy
-   * the data, but do NOT modify paramsSize — the host expects 0.
-   */
   copy_size = nested_size;
 
   if (user_ptr && copy_size == 0) {
@@ -382,7 +469,6 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
       pr_debug("nv_ioctl_nested: hClass=0x%x paramsSize=0, copy_size=%u\n",
                hClass, copy_size);
     } else {
-      /* RM_CONTROL with paramsSize==0 but non-null pointer — fallback */
       copy_size = 512;
       pr_warn_once("nv_ioctl_nested: RM_CONTROL paramsSize==0 with non-null ptr, using fallback %u\n",
                    copy_size);
@@ -404,8 +490,143 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
     }
   }
 
-  /* Zero the pointer — backend will set its own host pointer.
-   * Do NOT modify paramsSize — host kernel expects the original value. */
+  /*
+   * V1→V2 rewriting.
+   *
+   * Only applies to RM_CONTROL (outer_size == RMCTL_OUTER_SIZE).
+   * Check if the cmd matches a V1 entry; if so, rewrite to V2.
+   */
+  if (outer_size == RMCTL_OUTER_SIZE && nested_buf) {
+    u32 ctl_cmd;
+    memcpy(&ctl_cmd, &outer[8], sizeof(u32));
+
+    rewrite = find_v1v2_rewrite(ctl_cmd);
+    if (rewrite) {
+      void *v2_buf;
+      u32 min_v1_size;
+
+      /* Validate V1 nested is big enough to contain the userspace pointer */
+      min_v1_size = rewrite->v1_userptr_offset + 8; /* NvP64 = 8 bytes */
+      if (copy_size < min_v1_size) {
+        pr_err("v1v2: V1 nested too small (%u < %u) for cmd 0x%x\n",
+               copy_size, min_v1_size, ctl_cmd);
+        rewrite = NULL;
+        goto skip_rewrite;
+      }
+
+      /* Extract the userspace data pointer from V1 nested params */
+      memcpy(&saved_user_ptr, nested_buf + rewrite->v1_userptr_offset,
+             sizeof(u64));
+
+      if (!saved_user_ptr) {
+        pr_warn("v1v2: data pointer is NULL for cmd 0x%x, skipping rewrite\n",
+                ctl_cmd);
+        rewrite = NULL;
+        goto skip_rewrite;
+      }
+
+      /*
+       * For GET_INFO: the listSize at V1 offset 0 tells us how many items
+       * the guest expects. Compute actual data bytes to copy back.
+       * For GET_CAPS: capsTblSize at V1 offset 0 is the byte count.
+       */
+      if (rewrite->v1_copy_prefix > 0) {
+        /* GET_INFO pattern: listSize is item count, each item is 8 bytes */
+        u32 list_size;
+        memcpy(&list_size, nested_buf, sizeof(u32));
+        saved_user_data_size = min_t(u32, list_size * 8, rewrite->v2_data_size);
+      } else {
+        /* GET_CAPS pattern: capsTblSize is byte count */
+        u32 caps_tbl_size;
+        memcpy(&caps_tbl_size, nested_buf, sizeof(u32));
+        saved_user_data_size = min_t(u32, caps_tbl_size, rewrite->v2_data_size);
+      }
+
+      saved_v1_cmd = ctl_cmd;
+      memcpy(&saved_v1_params_size, &outer[size_offset], sizeof(u32));
+
+      pr_debug("v1v2: rewriting cmd 0x%x → 0x%x (V2 size %u, data_back %u)\n",
+               ctl_cmd, rewrite->v2_cmd,
+               rewrite->v2_size, saved_user_data_size);
+
+      /* Allocate V2 buffer, zeroed */
+      v2_buf = kzalloc(rewrite->v2_size, GFP_KERNEL);
+      if (!v2_buf) {
+        ret = -ENOMEM;
+        goto out;
+      }
+
+      /* Copy prefix from V1 into V2 (e.g., listSize or ceEngineType) */
+      if (rewrite->v1_copy_prefix > 0 &&
+          copy_size >= rewrite->v1_copy_prefix) {
+        memcpy(v2_buf, nested_buf, rewrite->v1_copy_prefix);
+      }
+
+      /* Replace nested buffer with V2 */
+      kfree(nested_buf);
+      nested_buf = v2_buf;
+      copy_size = rewrite->v2_size;
+
+      /* Update outer: cmd → V2 cmd, paramsSize → V2 size */
+      memcpy(&outer[8], &rewrite->v2_cmd, sizeof(u32));
+      memcpy(&outer[size_offset], &rewrite->v2_size, sizeof(u32));
+    }
+  }
+skip_rewrite:
+
+  /*
+   * Translate embedded fds in certain RM_CONTROL nested params.
+   * Only when NOT doing a V1→V2 rewrite (mutually exclusive).
+   */
+  if (outer_size == RMCTL_OUTER_SIZE && nested_buf && !rewrite) {
+    u32 ctl_cmd;
+    memcpy(&ctl_cmd, &outer[8], sizeof(u32));
+
+    if (ctl_cmd == 0x3d05 && copy_size >= 20) {
+      int guest_fd;
+      u64 handle;
+
+      memcpy(&guest_fd, nested_buf + 16, sizeof(int));
+      saved_nested_fd = guest_fd;
+      nested_fd_offset = 16;
+
+      ret = guest_fd_to_handle(guest_fd, &handle);
+      if (ret) {
+        pr_err("EXPORT_TO_FD: cannot translate guest fd %d: %ld\n",
+               guest_fd, ret);
+        goto out;
+      }
+      {
+        u32 h32 = (u32)handle;
+        memcpy(nested_buf + 16, &h32, sizeof(u32));
+      }
+      pr_debug("EXPORT_TO_FD: guest fd %d → handle %llu\n",
+               guest_fd, handle);
+
+    } else if (ctl_cmd == 0x3d06 && copy_size >= 4) {
+      int guest_fd;
+      u64 handle;
+
+      memcpy(&guest_fd, nested_buf, sizeof(int));
+      saved_nested_fd = guest_fd;
+      nested_fd_offset = 0;
+
+      ret = guest_fd_to_handle(guest_fd, &handle);
+      if (ret) {
+        pr_err("IMPORT_FROM_FD: cannot translate guest fd %d: %ld\n",
+               guest_fd, ret);
+        goto out;
+      }
+      {
+        u32 h32 = (u32)handle;
+        memcpy(nested_buf, &h32, sizeof(u32));
+      }
+      pr_debug("IMPORT_FROM_FD: guest fd %d → handle %llu\n",
+               guest_fd, handle);
+    }
+  }
+
+  /* Zero the pointer in outer — backend sets its own */
   memset(&outer[ptr_offset], 0, sizeof(u64));
 
   /* Build combined buffer: outer + nested */
@@ -452,8 +673,39 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
     void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
     u32 resp_total = le32_to_cpu(iresp->param_size);
 
-    if (resp_total >= outer_size) {
-      /* Restore original userspace pointer before copying outer back */
+    if (rewrite) {
+      /*
+       * V1→V2 rewrite response path.
+       */
+      if (resp_total < outer_size) {
+        pr_err("v1v2: response too short (%u < %u)\n",
+               resp_total, outer_size);
+        ret = -EIO;
+        goto out;
+      }
+
+      /* Copy V2 result data back to guest's original userspace pointer */
+      if (resp_total > outer_size && saved_user_ptr && saved_user_data_size > 0) {
+        u32 resp_nested_size = resp_total - outer_size;
+        u32 avail = 0;
+
+        if (resp_nested_size > rewrite->v2_data_offset)
+          avail = resp_nested_size - rewrite->v2_data_offset;
+
+        if (avail > 0) {
+          u32 copy_back = min_t(u32, saved_user_data_size, avail);
+          if (copy_to_user((void __user *)saved_user_ptr,
+                           resp_params + outer_size + rewrite->v2_data_offset,
+                           copy_back)) {
+            ret = -EFAULT;
+            goto out;
+          }
+        }
+      }
+
+      /* Restore V1 outer: cmd, paramsSize, userspace pointer */
+      memcpy(resp_params + 8, &saved_v1_cmd, sizeof(u32));
+      memcpy(resp_params + size_offset, &saved_v1_params_size, sizeof(u32));
       memcpy(resp_params + ptr_offset, &user_ptr, sizeof(u64));
 
       if (copy_to_user(uarg, resp_params, outer_size)) {
@@ -461,10 +713,24 @@ static long nv_ioctl_nested(struct file *filp, unsigned int cmd,
         goto out;
       }
 
-      /* Copy nested params back to original userspace pointer */
+    } else if (resp_total >= outer_size) {
+      /* Normal (non-rewrite) path */
+      memcpy(resp_params + ptr_offset, &user_ptr, sizeof(u64));
+
+      if (copy_to_user(uarg, resp_params, outer_size)) {
+        ret = -EFAULT;
+        goto out;
+      }
+
       if (user_ptr && copy_size > 0) {
         u32 resp_nested = resp_total - outer_size;
         u32 copy_len = min_t(u32, resp_nested, copy_size);
+
+        if (saved_nested_fd >= 0 && copy_len >= nested_fd_offset + 4) {
+          memcpy(resp_params + outer_size + nested_fd_offset,
+                 &saved_nested_fd, sizeof(int));
+        }
+
         if (copy_len > 0) {
           if (copy_to_user((void __user *)user_ptr,
                            resp_params + outer_size, copy_len)) {
@@ -515,11 +781,7 @@ static int guest_fd_to_handle(int guest_fd, u64 *out_handle)
 }
 
 /* -------------------------------------------------------------------------
- * nv_ioctl_fd_carrying — handle ioctls with embedded fd numbers
- *
- * NV_ESC_REGISTER_FD:   fd at offset 0 (4 bytes total)
- * NV_ESC_ALLOC_OS_EVENT: fd at offset 8 (16 bytes total)
- * NV_ESC_FREE_OS_EVENT:  fd at offset 8 (16 bytes total)
+ * nv_ioctl_fd_carrying
  * ---------------------------------------------------------------------- */
 
 static long nv_ioctl_fd_carrying(struct file *filp, unsigned int cmd,
@@ -528,6 +790,7 @@ static long nv_ioctl_fd_carrying(struct file *filp, unsigned int cmd,
   struct nv_file_ctx *ctx = filp->private_data;
   struct nv_dev *ndev = ctx->dev;
   unsigned int param_size = _IOC_SIZE(cmd);
+  unsigned int escape = _IOC_NR(cmd);
   void __user *uarg = (void __user *)arg;
 
   struct {
@@ -556,23 +819,23 @@ static long nv_ioctl_fd_carrying(struct file *filp, unsigned int cmd,
     goto out;
   }
 
-  /* Read the embedded fd number */
   memcpy(&orig_fd, param_buf + fd_offset, sizeof(int));
 
-  /* Translate fd → guest_handle */
-  ret = guest_fd_to_handle(orig_fd, &handle);
-  if (ret) {
-    pr_err("nv_ioctl_fd_carrying: bad embedded fd %d: %ld\n", orig_fd, ret);
-    goto out;
+  if (orig_fd == -1) {
+    handle = ctx->guest_handle;
+  } else {
+    ret = guest_fd_to_handle(orig_fd, &handle);
+    if (ret) {
+      pr_err("nv_ioctl_fd_carrying: bad embedded fd %d: %ld\n", orig_fd, ret);
+      goto out;
+    }
   }
 
-  /* Replace fd with guest_handle (backend will translate to host fd) */
   {
     u32 handle32 = (u32)handle;
     memcpy(param_buf + fd_offset, &handle32, sizeof(u32));
   }
 
-  /* Send request */
   req.req_hdr.msg_type = cpu_to_le32(NV_MSG_IOCTL);
   req.req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
   req.req_hdr._pad = 0;
@@ -599,13 +862,31 @@ static long nv_ioctl_fd_carrying(struct file *filp, unsigned int cmd,
 
   iresp = (struct ioctl_resp *)resp.resp_payload;
 
-  if (param_size && iresp->param_size) {
+  {
     u32 copy_len = min_t(u32, param_size, le32_to_cpu(iresp->param_size));
     void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
 
-    /* Restore original fd before copying back to userspace */
+    /* Restore original fd before copying back */
     if (copy_len >= fd_offset + 4)
       memcpy(resp_params + fd_offset, &orig_fd, sizeof(int));
+
+    if (escape == 0x4E && le64_to_cpu(iresp->shm_length) > 0) {
+      u64 shm_off = le64_to_cpu(iresp->shm_offset);
+      u64 shm_len = le64_to_cpu(iresp->shm_length);
+      u8 pgprot_val = iresp->pgprot;
+
+      struct nv_mapping_info *mi = kmalloc(sizeof(*mi), GFP_KERNEL);
+      if (mi) {
+        mi->shm_offset = shm_off;
+        mi->shm_length = shm_len;
+        mi->pgprot = pgprot_val;
+        spin_lock(&ndev->mappings_lock);
+        list_add_tail(&mi->list, &ndev->mappings);
+        spin_unlock(&ndev->mappings_lock);
+        pr_info("nv_ioctl: pushed SHM mapping: offset=0x%llx len=0x%llx\n",
+                shm_off, shm_len);
+      }
+    }
 
     if (copy_to_user(uarg, resp_params, copy_len)) {
       ret = -EFAULT;
@@ -626,8 +907,28 @@ out:
 
 long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
   unsigned int escape = _IOC_NR(cmd);
+  unsigned int ioc_type = _IOC_TYPE(cmd);
+  unsigned int param_size = _IOC_SIZE(cmd);
 
-  /* Ioctls with embedded userspace pointers need special handling */
+  pr_debug("nv_ioctl: escape=0x%x size=%u\n", escape, param_size);
+
+  /* nvidia-modeset ioctls use type 'm' (0x6d), not 'F' (0x46).
+   * They have embedded userspace pointers in the same way as RM_CONTROL:
+   *   struct nvkms_ioctl_params {
+   *     NvU32 cmd;       // offset 0
+   *     NvU32 dataSize;  // offset 4
+   *     NvU64 pData;     // offset 8 — userspace pointer
+   *   };
+   * Total: 16 bytes.
+   */
+  if (ioc_type == 0x6d) {
+    return nv_ioctl_nested(filp, cmd, arg,
+                           16,   /* outer_size */
+                           8,    /* ptr_offset (pData) */
+                           4);   /* size_offset (dataSize) */
+  }
+
+  /* Standard NV_ESC ioctls (type 'F' = 0x46) */
   switch (escape) {
     case 0x2A: /* NV_ESC_RM_CONTROL */
       return nv_ioctl_nested(filp, cmd, arg,
@@ -635,6 +936,10 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     case 0x2B: /* NV_ESC_RM_ALLOC */
       return nv_ioctl_nested(filp, cmd, arg,
                              RMALLOC_OUTER_SIZE, RMALLOC_PTR_OFFSET, RMALLOC_SIZE_OFFSET);
+    case 0x4E: /* NV_ESC_RM_MAP_MEMORY — fd at offset 48 */
+      return nv_ioctl_fd_carrying(filp, cmd, arg, 48);
+    case 0x27: /* RM_ALLOC_MEMORY — fd at offset 48 */
+      return nv_ioctl_fd_carrying(filp, cmd, arg, 48);
     case 0xC9: /* NV_ESC_REGISTER_FD */
       return nv_ioctl_fd_carrying(filp, cmd, arg, 0);
     case 0xCE: /* NV_ESC_ALLOC_OS_EVENT */
@@ -707,6 +1012,13 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
       u32 copy_len = min_t(u32, param_size, le32_to_cpu(iresp->param_size));
       void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
 
+      /* Debug: log RM_MAP_MEMORY status */
+      if (escape == 0x27 && copy_len >= 48) {
+        u32 map_status;
+        memcpy(&map_status, resp_params + 40, sizeof(u32)); /* NVOS33 status offset */
+        pr_info("nv_ioctl: RM_MAP_MEMORY status=0x%x\n", map_status);
+      }
+
       if (copy_to_user((void __user *)arg, resp_params, copy_len)) {
         ret = -EFAULT;
         goto out_simple;
@@ -719,9 +1031,6 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         mi->shm_offset = le64_to_cpu(iresp->shm_offset);
         mi->shm_length = le64_to_cpu(iresp->shm_length);
         mi->pgprot = iresp->pgprot;
-        spin_lock(&ctx->mappings_lock);
-        list_add_tail(&mi->list, &ctx->mappings);
-        spin_unlock(&ctx->mappings_lock);
       }
     }
 

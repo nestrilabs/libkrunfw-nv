@@ -30,7 +30,7 @@
 #define NUM_QUEUES 1
 
 /* Maximum number of bytes in a single ioctl param buffer. */
-#define NV_MAX_PARAM_SIZE 4096
+#define NV_MAX_PARAM_SIZE 65536
 
 /* -------------------------------------------------------------------------
  * Message type discriminants  (MsgHeader::msg_type)
@@ -59,6 +59,11 @@
 #define NV_DEV_CTL 0 /* /dev/nvidiactl  */
 #define NV_DEV_GPU 1 /* /dev/nvidia0..N */
 #define NV_DEV_UVM 2 /* /dev/nvidia-uvm */
+
+// MODESET
+
+#define NV_DEV_MODESET  3
+#define NV_MINOR_MODESET 254
 
 /* -------------------------------------------------------------------------
  * Common headers
@@ -210,8 +215,6 @@ struct nv_mapping_info {
 struct nv_file_ctx {
   __u64 guest_handle;
   struct nv_dev *dev;
-  struct list_head mappings;
-  spinlock_t mappings_lock;
 };
 
 #endif /* VIRTIO_GPU_NV_H */
