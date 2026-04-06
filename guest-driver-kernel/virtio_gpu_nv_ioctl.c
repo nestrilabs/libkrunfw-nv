@@ -175,9 +175,10 @@ static u32 rmalloc_class_param_size(u32 hClass)
     case 0x2081: return  4;  /* NV2081_ALLOC_PARAMETERS (similar) */
 
     /* Memory allocation classes */
-    case 0x0002: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_SYSTEM) */
-    case 0x003e: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_LOCAL_USER) */
-    case 0x00fb: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV50_MEMORY_VIRTUAL) */
+    case 0x003e: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_SYSTEM) */
+    case 0x0040: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_LOCAL_USER) */
+    case 0x0070: return 56;  /* NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS (NV01_MEMORY_VIRTUAL) */
+    case 0x50a0: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV50_MEMORY_VIRTUAL) */
 
     /* VASPACE */
     case 0x90f1: return 56;  /* NV_VASPACE_ALLOCATION_PARAMETERS */
@@ -354,31 +355,41 @@ static const struct v1v2_rewrite_entry v1v2_table[] = {
     /* ---- GET_CAPS: V1 = {u32 capsTblSize, NvP64 capsTbl} ---- */
     /*                v1_cmd      v2_cmd      v2sz  ptr_off prefix d_off d_sz */
 
-    /* FB_GET_CAPS */
+    /* Device-level GET_CAPS */
+    /* FB_GET_CAPS (device) */
     { 0x00801301, 0x00801307,     3,     8,     0,    0,    3 },
-    /* HOST_GET_CAPS */
+    /* HOST_GET_CAPS (device) */
     { 0x00801401, 0x00801402,     3,     8,     0,    0,    3 },
-    /* FIFO_GET_CAPS */
+    /* FIFO_GET_CAPS (device) */
     { 0x00801701, 0x00801713,     2,     8,     0,    0,    2 },
-    /* GR_GET_CAPS */
+    /* GR_GET_CAPS (device) */
     { 0x00801102, 0x00801109,    48,     8,     0,    0,   23 },
-    /* MSENC_GET_CAPS */
+    /* MSENC_GET_CAPS (device) */
     { 0x00801b01, 0x00801b02,    12,     8,     0,    0,    6 },
-    /* NVJPG_GET_CAPS */
+    /* NVJPG_GET_CAPS (device) */
     { 0x00801f01, 0x00801f02,    16,     8,     0,    0,    9 },
-    /* BSP_GET_CAPS */
+    /* BSP_GET_CAPS (device) */
     { 0x00801c01, 0x00801c02,     8,     8,     0,    0,    8 },
+
+    /* Subdevice-level GET_CAPS — critical for vkCreateDevice */
+    /* GR_GET_CAPS (subdevice): V2 = {NvU8[23], pad(1), GR_ROUTE_INFO(16), NvBool(4), pad(4)} = 48 */
+    { 0x20801202, 0x20801227,    48,     8,     0,    0,   23 },
+    /* FIFO_GET_CAPS (subdevice): V2 = {NvU8[2], pad(2)} = 4, round up to 2 u32s */
+    { 0x20801701, 0x20801713,     4,     8,     0,    0,    2 },
+    /* FB_GET_CAPS (subdevice): V2 = {NvU8[3], pad(1)} = 4, round up to 1 u32 */
+    { 0x20801301, 0x20801307,     4,     8,     0,    0,    3 },
+
     /* CE_GET_CAPS: V1 = {u32 ceEngineType, u32 capsTblSize, NvP64 capsTbl} */
     { 0x20802a01, 0x20802a03,     8,    16,     4,    4,    2 },
 
     /* ---- GET_INFO: V1 = {u32 listSize, NvP64 list} ---- */
 
-    /* GR_GET_INFO: V2 = {u32 listSize, GR_INFO[59], GR_ROUTE_INFO} */
+    /* GR_GET_INFO (device): V2 = {u32 listSize, GR_INFO[59], GR_ROUTE_INFO} */
     { 0x00801104, 0x00801110,   496,     8,     4,    4,  472 },
-    /* FB_GET_INFO (subdevice): V2 = {u32 listSize, FB_INFO[128]} */
-    { 0x20801301, 0x20801303,  1028,     8,     4,    4, 1024 },
     /* GR_GET_INFO (subdevice): V2 = {u32 listSize, GR_INFO[59], pad(4), GR_ROUTE_INFO(16)} */
     { 0x20801201, 0x20801228,   496,     8,     4,    4,  472 },
+    /* FB_GET_INFO (subdevice): V2 = {u32 listSize, FB_INFO[128]} */
+    { 0x20801302, 0x20801303,  1028,     8,     4,    4, 1024 },
     /* GPU_GET_INFO: V2 = {u32 listSize, GPU_INFO[70]} */
     { 0x20800101, 0x20800102,   564,     8,     4,    4,  560 },
     /* BUS_GET_INFO: V2 = {u32 listSize, BUS_INFO[52]} */
