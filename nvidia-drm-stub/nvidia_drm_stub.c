@@ -40,6 +40,10 @@ module_param(pci_bus, uint, 0444);
 module_param(pci_slot, uint, 0444);
 module_param(pci_func, uint, 0444);
 
+static uint gpu_id = 0x0100;
+module_param(gpu_id, uint, 0444);
+MODULE_PARM_DESC(gpu_id, "GPU ID to report in GET_DEV_INFO (default 0x0100)");
+
 MODULE_PARM_DESC(vendor_id, "PCI vendor ID  (default 0x10de = NVIDIA)");
 MODULE_PARM_DESC(device_id, "PCI device ID  (default 0x1f08 = RTX 2060)");
 MODULE_PARM_DESC(pci_bus, "PCI bus number shown in sysfs device name");
@@ -78,7 +82,7 @@ struct drm_nvidia_get_dev_info_params {
 static int nv_stub_get_dev_info(struct drm_device *dev, void *data,
                                 struct drm_file *filep) {
   struct drm_nvidia_get_dev_info_params *p = data;
-  p->gpu_id = 0x800;
+  p->gpu_id = gpu_id;
   p->mig_device = 0;
   p->primary_index = dev->primary ? dev->primary->index : 1;
   p->supports_alloc = 1;
