@@ -15,6 +15,13 @@
 
 #include <linux/types.h>
 
+/*
+ * NVIDIA defines from open-gpu-kernel-modules
+ * (included via Makefile ccflags)
+ */
+#include <nv_escape.h>
+#include <nv-ioctl-numbers.h>
+
 /* Must match host driver AND guest userspace library version exactly */
 #define NV_DRIVER_VERSION "595.58.03"
 

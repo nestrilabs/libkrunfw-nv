@@ -17,6 +17,9 @@
 #include <drm/drm_file.h>
 #include <drm/drm_ioctl.h>
 
+/* NVIDIA DRM ioctl definitions from open-gpu-kernel-modules */
+#include <nv_drm_common_ioctl.h>
+
 #define DRIVER_NAME "nvidia-drm"
 #define DRIVER_DESC "NVIDIA DRM stub for virtio-gpu-nv"
 #define DRIVER_DATE "20250101"
@@ -49,34 +52,7 @@ MODULE_PARM_DESC(device_id, "PCI device ID  (default 0x1f08 = RTX 2060)");
 MODULE_PARM_DESC(pci_bus, "PCI bus number shown in sysfs device name");
 MODULE_PARM_DESC(pci_slot, "PCI slot number shown in sysfs device name");
 
-/* ----------------------------------------------------------------
- * NVIDIA custom DRM ioctls
- * ---------------------------------------------------------------- */
-#define DRM_NVIDIA_GET_DEV_INFO 0x03
-#define DRM_NVIDIA_FENCE_SUPPORTED 0x04
-#define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f
-
-#define DRM_IOCTL_NVIDIA_GET_DEV_INFO                                          \
-  DRM_IOWR((DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO),                       \
-           struct drm_nvidia_get_dev_info_params)
-#define DRM_IOCTL_NVIDIA_FENCE_SUPPORTED                                       \
-  DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_FENCE_SUPPORTED)
-#define DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED                                      \
-  DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_DMABUF_SUPPORTED)
-
-struct drm_nvidia_get_dev_info_params {
-  uint32_t gpu_id;
-  uint32_t mig_device;
-  uint32_t primary_index;
-  uint32_t supports_alloc;
-  uint32_t generic_page_kind;
-  uint32_t page_kind_generation;
-  uint32_t sector_layout;
-  uint32_t supports_sync_fd;
-  uint32_t supports_semsurf;
-};
-
-/* ----------------------------------------------------------------
+/* -------------------------------------------------------------------------
  * DRM ioctl handlers
  * ---------------------------------------------------------------- */
 static int nv_stub_get_dev_info(struct drm_device *dev, void *data,

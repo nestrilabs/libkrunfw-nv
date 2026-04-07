@@ -109,6 +109,8 @@ $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES) $(NESTRI_DRIVERS_SRC)
 	@echo "Syncing updated drivers into the kernel tree..."
 	@rsync -a --delete guest-driver-kernel/ $(KERNEL_SOURCES)/drivers/virtio/gpu_nv/
 	@rsync -a --delete nvidia-drm-stub/ $(KERNEL_SOURCES)/drivers/gpu/drm/nvidia-drm-stub/
+	# Also sync open-gpu-kernel-modules for header includes
+	@rsync -a --delete open-gpu-kernel-modules/ $(KERNEL_SOURCES)/open-gpu-kernel-modules/
 	cd $(KERNEL_SOURCES) ; rm -f .version ; $(MAKE) $(MAKEFLAGS) $(KERNEL_FLAGS)
 
 ifeq ($(OS),Darwin)

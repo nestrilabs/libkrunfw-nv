@@ -48,6 +48,18 @@
 #include "virtio_gpu_nv.h"
 #include "virtio_gpu_nv_priv.h"
 
+/* NVIDIA class IDs from open-gpu-kernel-modules */
+#include <class/cl0002.h>  /* NV01_CONTEXT_DMA_FROM_MEMORY */
+#include <class/cl003e.h>  /* NV01_MEMORY_SYSTEM */
+#include <class/cl0040.h>  /* NV01_MEMORY_LOCAL_USER */
+#include <class/cl0070.h>  /* NV01_MEMORY_VIRTUAL */
+#include <class/cl0080.h>  /* NV01_DEVICE_0 */
+#include <class/cl2080.h>  /* NV20_SUBDEVICE_0 */
+#include <class/cl2081.h>  /* NV2081_BINAPI */
+#include <class/cl50a0.h>  /* NV50_MEMORY_VIRTUAL */
+#include <class/cl90f1.h>  /* FERMI_VASPACE_A */
+#include <class/cla06c.h>  /* KEPLER_CHANNEL_GROUP_A */
+
 /* -------------------------------------------------------------------------
  * Cookie generation
  * ---------------------------------------------------------------------- */
@@ -168,31 +180,44 @@ static int nv_release(struct inode *inode, struct file *filp) {
 static u32 rmalloc_class_param_size(u32 hClass)
 {
     switch (hClass) {
-    /* From gVisor nvproxy allocationClass table + open-gpu-kernel-modules headers */
-    case 0x0041: return 12;  /* NV0000_ALLOC_PARAMETERS (hClient, processID, subProcessID) */
-    case 0x0080: return 52;  /* NV0080_ALLOC_PARAMETERS */
-    case 0x2080: return  4;  /* NV2080_ALLOC_PARAMETERS */
-    case 0x2081: return  4;  /* NV2081_ALLOC_PARAMETERS (similar) */
+    /* Root client - NV04_MEMORY (0x0041) */
+    case 0x0041: return 12;  /* NV0000_ALLOC_PARAMETERS */
 
-    /* Memory allocation classes */
-    case 0x003e: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_SYSTEM) */
-    case 0x0040: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_LOCAL_USER) */
-    case 0x0070: return 56;  /* NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS (NV01_MEMORY_VIRTUAL) */
-    case 0x50a0: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV50_MEMORY_VIRTUAL) */
+    /* Device / subdevice */
+    case NV01_DEVICE_0: return 52;  /* NV0080_ALLOC_PARAMETERS */
+    case NV20_SUBDEVICE_0: return  4;  /* NV2080_ALLOC_PARAMETERS */
+    case NV2081_BINAPI: return  4;  /* NV2081_ALLOC_PARAMETERS */
+
+    /* Context DMA — NV_CONTEXT_DMA_ALLOCATION_PARAMS (32 bytes) */
+    case NV01_CONTEXT_DMA_FROM_MEMORY: return 32;
+
+    /* Memory allocation classes — NV_MEMORY_ALLOCATION_PARAMS (128 bytes) */
+    case NV01_MEMORY_SYSTEM: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_SYSTEM) */
+    case NV01_MEMORY_LOCAL_USER: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV01_MEMORY_LOCAL_USER) */
+    case NV50_MEMORY_VIRTUAL: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS (NV50_MEMORY_VIRTUAL) */
+
+    /* Memory virtual — NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS (24 bytes) */
+    case NV01_MEMORY_VIRTUAL: return 24;  /* NV01_MEMORY_VIRTUAL */
+
+    /* Memory fabric imported ref — NV00FB_ALLOCATION_PARAMETERS (32 bytes) */
+    case 0x00fb: return 32;
+
+    /* Memory multicast fabric — uses its own params, not NV_MEMORY_ALLOCATION_PARAMS */
+    case 0x00fc: return 64;  /* NV00FD_ALLOCATION_PARAMETERS — need to verify */
 
     /* VASPACE */
-    case 0x90f1: return 56;  /* NV_VASPACE_ALLOCATION_PARAMETERS */
+    case FERMI_VASPACE_A: return 56;  /* NV_VASPACE_ALLOCATION_PARAMETERS */
 
     /* Channel group */
-    case 0xa06c: return 20;  /* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS */
+    case KEPLER_CHANNEL_GROUP_A: return 20;  /* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS */
 
-    /* Channels — NV_CHANNEL_ALLOC_PARAMS is large (~128-160 bytes) */
-    case 0xb06f: return 160; /* TURING_CHANNEL_GPFIFO_A */
-    case 0xc06f: return 160; /* AMPERE_CHANNEL_GPFIFO_A */
-    case 0xc46f: return 160; /* HOPPER_CHANNEL_GPFIFO_A */
+    /* Channels — NV_CHANNEL_ALLOC_PARAMS */
+    case 0xc46f: return 160; /* TURING_CHANNEL_GPFIFO_A */
+    case 0xc56f: return 160; /* AMPERE_CHANNEL_GPFIFO_A */
+    case 0xc86f: return 160; /* HOPPER_CHANNEL_GPFIFO_A */
 
-    /* Graphics/compute objects */
-    case 0xc597: return  8;  /* NV_GR_ALLOCATION_PARAMETERS (TURING_A etc.) */
+    /* Graphics/compute objects — NV_GR_ALLOCATION_PARAMETERS (8 bytes) */
+    case 0xc597: return  8;  /* TURING_A */
     case 0xc697: return  8;  /* AMPERE_A */
     case 0xc797: return  8;  /* ADA_A */
     case 0xcb97: return  8;  /* HOPPER_A */
@@ -202,27 +227,30 @@ static u32 rmalloc_class_param_size(u32 hClass)
     case 0xc9c0: return  8;  /* ADA_COMPUTE_A */
     case 0xcbc0: return  8;  /* HOPPER_COMPUTE_A */
 
-    /* 2D, inline-to-memory */
-    case 0x902d: return  8;  /* FERMI_TWOD_A — NV_GR_ALLOCATION_PARAMETERS */
+    /* 2D, inline-to-memory — NV_GR_ALLOCATION_PARAMETERS (8 bytes) */
+    case 0x902d: return  8;  /* FERMI_TWOD_A */
     case 0xa140: return  8;  /* KEPLER_INLINE_TO_MEMORY_B */
 
-    /* DMA copy */
-    case 0xc5b5: return  4;  /* NVB0B5_ALLOCATION_PARAMETERS (TURING_DMA_COPY_A) */
+    /* DMA copy — NVB0B5_ALLOCATION_PARAMETERS (4 bytes) */
+    case 0xc5b5: return  4;  /* TURING_DMA_COPY_A */
     case 0xc6b5: return  4;  /* AMPERE_DMA_COPY_A */
     case 0xc7b5: return  4;  /* AMPERE_DMA_COPY_B */
-    case 0xcbb5: return  4;  /* HOPPER_DMA_COPY_A */
+    case 0xc8b5: return  4;  /* HOPPER_DMA_COPY_A */
+    case 0xcbb5: return  4;  /* (if needed) */
 
-    /* Video decode/encode */
-    case 0xc4b0: return  8;  /* NV_BSP_ALLOCATION_PARAMETERS */
+    /* Video decode — NV_BSP_ALLOCATION_PARAMETERS (8 bytes) */
+    case 0xb8b0: return  8;
+    case 0xc4b0: return  8;
     case 0xc6b0: return  8;
     case 0xc7b0: return  8;
     case 0xc9b0: return  8;
-    case 0xb8b0: return  8;
-    case 0xc4b7: return  8;  /* NV_MSENC_ALLOCATION_PARAMETERS */
+
+    /* Video encode — NV_MSENC_ALLOCATION_PARAMETERS (8 bytes) */
+    case 0xc4b7: return  8;
     case 0xc7b7: return  8;
     case 0xc9b7: return  8;
 
-    /* P2P, third-party P2P */
+    /* P2P */
     case 0x503b: return 16;  /* NV503B_ALLOC_PARAMETERS */
     case 0x503c: return  8;  /* NV503C_ALLOC_PARAMETERS */
 
@@ -248,9 +276,6 @@ static u32 rmalloc_class_param_size(u32 hClass)
     /* Confidential compute */
     case 0xcb33: return 16;  /* NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS */
 
-    /* Memory virtual (NV01_MEMORY_VIRTUAL) */
-    case 0x00fc: return 64;  /* NV_MEMORY_ALLOCATION_PARAMS */
-
     /* Memory mapper */
     case 0x00fe: return  8;  /* NV_MEMORY_MAPPER_ALLOCATION_PARAMS */
 
@@ -260,17 +285,17 @@ static u32 rmalloc_class_param_size(u32 hClass)
     /* RM user shared data */
     case 0x00de: return  4;  /* NV00DE_ALLOC_PARAMETERS */
 
-    /* No-params classes return 0 — caller will skip nested copy */
-    case 0xc3b5: return  0;  /* GF100_PROFILER */
-    case 0xc570: return  0;  /* TURING_USERMODE_A */
-    case 0xc670: return  0;  /* VOLTA_USERMODE_A */
-    case 0xc4d1: return  0;  /* HOPPER_SEC2_WORK_LAUNCH_A */
+    /* No-params classes */
+    case 0x90cc: return  0;  /* GF100_PROFILER */
+    case 0xc461: return  0;  /* TURING_USERMODE_A */
+    case 0xc361: return  0;  /* VOLTA_USERMODE_A */
+    case 0xcba2: return  0;  /* HOPPER_SEC2_WORK_LAUNCH_A */
     case 0x0073: return  0;  /* NV04_DISPLAY_COMMON */
     case 0x208f: return  0;  /* NV20_SUBDEVICE_DIAG */
-    case 0x9010: return  0;  /* GF100_ZBC_CLEAR */
-    case 0xa080: return  0;  /* GF100_SUBDEVICE_MASTER */
+    case 0x9096: return  0;  /* GF100_ZBC_CLEAR */
+    case 0x90e6: return  0;  /* GF100_SUBDEVICE_MASTER */
 
-    default:     return 512; /* Conservative fallback for unknown classes */
+    default:     return 512; /* Conservative fallback */
     }
 }
 
@@ -340,17 +365,6 @@ struct v1v2_rewrite_entry {
     u32 v2_data_size;       /* max result data bytes to copy back to guest ptr */
 };
 
-/*
- * Note on V2 struct sizes with alignment:
- *
- * GR_GET_CAPS V2: {NvU8[23], pad(1), GR_ROUTE_INFO(16), NvBool(4), pad(4)} = 48
- * GR_GET_INFO V2: {NvU32(4), GR_INFO[59](472), pad(4), GR_ROUTE_INFO(16)} = 496
- * MSENC_GET_CAPS V2: {NvU8[6], pad(2), NvU32} = 12
- * NVJPG_GET_CAPS V2: {NvU8[9], pad(3), NvU32} = 16
- * CE_GET_CAPS V2: {NvU32, NvU8[2], pad(2)} = 8
- * FB_GET_INFO V2: {NvU32(4), FB_INFO[128](1024)} = 1028
- */
-
 static const struct v1v2_rewrite_entry v1v2_table[] = {
     /* ---- GET_CAPS: V1 = {u32 capsTblSize, NvP64 capsTbl} ---- */
     /*                v1_cmd      v2_cmd      v2sz  ptr_off prefix d_off d_sz */
@@ -362,7 +376,9 @@ static const struct v1v2_rewrite_entry v1v2_table[] = {
     { 0x00801401, 0x00801402,     3,     8,     0,    0,    3 },
     /* FIFO_GET_CAPS (device) */
     { 0x00801701, 0x00801713,     2,     8,     0,    0,    2 },
-    /* GR_GET_CAPS (device) */
+    /* FIFO_GET_CAPS (subdevice) */
+    { 0x20801701, 0x20801713,     2,     8,     0,    0,    2 },
+    /* GR_GET_CAPS */
     { 0x00801102, 0x00801109,    48,     8,     0,    0,   23 },
     /* MSENC_GET_CAPS (device) */
     { 0x00801b01, 0x00801b02,    12,     8,     0,    0,    6 },
@@ -941,21 +957,21 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
   /* Standard NV_ESC ioctls (type 'F' = 0x46) */
   switch (escape) {
-    case 0x2A: /* NV_ESC_RM_CONTROL */
+    case NV_ESC_RM_CONTROL: /* NV_ESC_RM_CONTROL */
       return nv_ioctl_nested(filp, cmd, arg,
                              RMCTL_OUTER_SIZE, RMCTL_PTR_OFFSET, RMCTL_SIZE_OFFSET);
-    case 0x2B: /* NV_ESC_RM_ALLOC */
+    case NV_ESC_RM_ALLOC: /* NV_ESC_RM_ALLOC */
       return nv_ioctl_nested(filp, cmd, arg,
                              RMALLOC_OUTER_SIZE, RMALLOC_PTR_OFFSET, RMALLOC_SIZE_OFFSET);
-    case 0x4E: /* NV_ESC_RM_MAP_MEMORY — fd at offset 48 */
+    case NV_ESC_RM_MAP_MEMORY: /* NV_ESC_RM_MAP_MEMORY — fd at offset 48 */
       return nv_ioctl_fd_carrying(filp, cmd, arg, 48);
-    case 0x27: /* RM_ALLOC_MEMORY — fd at offset 48 */
+    case NV_ESC_RM_ALLOC_MEMORY: /* RM_ALLOC_MEMORY — fd at offset 48 */
       return nv_ioctl_fd_carrying(filp, cmd, arg, 48);
-    case 0xC9: /* NV_ESC_REGISTER_FD */
+    case NV_ESC_REGISTER_FD: /* NV_ESC_REGISTER_FD */
       return nv_ioctl_fd_carrying(filp, cmd, arg, 0);
-    case 0xCE: /* NV_ESC_ALLOC_OS_EVENT */
+    case NV_ESC_ALLOC_OS_EVENT: /* NV_ESC_ALLOC_OS_EVENT */
       return nv_ioctl_fd_carrying(filp, cmd, arg, 8);
-    case 0xCF: /* NV_ESC_FREE_OS_EVENT */
+    case NV_ESC_FREE_OS_EVENT: /* NV_ESC_FREE_OS_EVENT */
       return nv_ioctl_fd_carrying(filp, cmd, arg, 8);
     default:
       break;
