@@ -2,13 +2,28 @@
 /*
  * nvidia_drm_stub.c — Minimal DRM stub that identifies as "nvidia-drm"
  *
- * Registers as a virtual PCI device so the NVIDIA Vulkan ICD sees the
- * correct PCI topology when walking sysfs from /dev/dri/renderD*.
+ * Uses a platform device but synthesises the sysfs attributes that the
+ * NVIDIA Vulkan ICD reads when walking up from /dev/dri/renderD* to
+ * determine whether it is on a PCI discrete GPU or a Tegra SoC.
+ *
+ * The ICD checks for the presence and content of:
+ *   <drm-node>/device/vendor          → "0x10de"
+ *   <drm-node>/device/device          → "0x1f08"
+ *   <drm-node>/device/class           → "0x030200"
+ *   <drm-node>/device/subsystem_vendor
+ *   <drm-node>/device/subsystem_device
+ *
+ * It also checks that <drm-node>/device is NOT under
+ * /sys/bus/platform (Tegra path).  We achieve this by creating a
+ * second fake "pci"-bus device as the parent of the platform device,
+ * which moves the sysfs subtree out of /sys/devices/platform/.
  */
 
+#include <linux/device.h>
 #include <linux/module.h>
-#include <linux/pci.h>
 #include <linux/platform_device.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -19,42 +34,8 @@
 #define DRIVER_DATE "20250101"
 
 /* ----------------------------------------------------------------
- * NVIDIA custom DRM ioctl definitions
+ * Module parameters — match these to what CARD_INFO returns
  * ---------------------------------------------------------------- */
-
-#define DRM_NVIDIA_GET_DEV_INFO 0x03
-#define DRM_NVIDIA_FENCE_SUPPORTED 0x04
-#define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f
-
-#define DRM_IOCTL_NVIDIA_GET_DEV_INFO                                          \
-  DRM_IOWR((DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO),                       \
-           struct drm_nvidia_get_dev_info_params)
-
-#define DRM_IOCTL_NVIDIA_FENCE_SUPPORTED                                       \
-  DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_FENCE_SUPPORTED)
-
-#define DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED                                      \
-  DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_DMABUF_SUPPORTED)
-
-struct drm_nvidia_get_dev_info_params {
-  uint32_t gpu_id;
-  uint32_t mig_device;
-  uint32_t primary_index;
-  uint32_t supports_alloc;
-  uint32_t generic_page_kind;
-  uint32_t page_kind_generation;
-  uint32_t sector_layout;
-  uint32_t supports_sync_fd;
-  uint32_t supports_semsurf;
-};
-
-/*
- * Module parameters — override these to match what your proxy
- * returns in CARD_INFO (vendor_id, device_id) and the PCI address
- * reported by the host RM (domain:bus:slot.func).
- *
- * Defaults match an RTX 2060 at 0000:08:00.0.
- */
 static uint vendor_id = 0x10de;
 static uint device_id = 0x1f08;
 static uint subsys_id = 0x0000;
@@ -71,27 +52,53 @@ module_param(pci_bus, uint, 0444);
 module_param(pci_slot, uint, 0444);
 module_param(pci_func, uint, 0444);
 
-MODULE_PARM_DESC(vendor_id, "PCI vendor ID (default 0x10de = NVIDIA)");
-MODULE_PARM_DESC(device_id, "PCI device ID (default 0x1f08 = RTX 2060)");
-MODULE_PARM_DESC(pci_bus, "PCI bus number to report in sysfs");
-MODULE_PARM_DESC(pci_slot, "PCI slot number to report in sysfs");
+MODULE_PARM_DESC(vendor_id, "PCI vendor ID  (default 0x10de = NVIDIA)");
+MODULE_PARM_DESC(device_id, "PCI device ID  (default 0x1f08 = RTX 2060)");
+MODULE_PARM_DESC(pci_bus, "PCI bus number shown in sysfs device name");
+MODULE_PARM_DESC(pci_slot, "PCI slot number shown in sysfs device name");
+
+/* ----------------------------------------------------------------
+ * NVIDIA custom DRM ioctls
+ * ---------------------------------------------------------------- */
+#define DRM_NVIDIA_GET_DEV_INFO 0x03
+#define DRM_NVIDIA_FENCE_SUPPORTED 0x04
+#define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f
+
+#define DRM_IOCTL_NVIDIA_GET_DEV_INFO                                          \
+  DRM_IOWR((DRM_COMMAND_BASE + DRM_NVIDIA_GET_DEV_INFO),                       \
+           struct drm_nvidia_get_dev_info_params)
+#define DRM_IOCTL_NVIDIA_FENCE_SUPPORTED                                       \
+  DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_FENCE_SUPPORTED)
+#define DRM_IOCTL_NVIDIA_DMABUF_SUPPORTED                                      \
+  DRM_IO(DRM_COMMAND_BASE + DRM_NVIDIA_DMABUF_SUPPORTED)
+
+struct drm_nvidia_get_dev_info_params {
+  uint32_t gpu_id;
+  uint32_t mig_device;
+  uint32_t primary_index;
+  uint32_t supports_alloc;
+  uint32_t generic_page_kind;
+  uint32_t page_kind_generation;
+  uint32_t sector_layout;
+  uint32_t supports_sync_fd;
+  uint32_t supports_semsurf;
+};
 
 /* ----------------------------------------------------------------
  * DRM ioctl handlers
  * ---------------------------------------------------------------- */
-
 static int nv_stub_get_dev_info(struct drm_device *dev, void *data,
                                 struct drm_file *filep) {
-  struct drm_nvidia_get_dev_info_params *params = data;
-  params->gpu_id = 0x800;
-  params->mig_device = 0;
-  params->primary_index = dev->primary ? dev->primary->index : 1;
-  params->supports_alloc = 1;
-  params->generic_page_kind = 6;
-  params->page_kind_generation = 2;
-  params->sector_layout = 1;
-  params->supports_sync_fd = 1;
-  params->supports_semsurf = 1;
+  struct drm_nvidia_get_dev_info_params *p = data;
+  p->gpu_id = 0x800;
+  p->mig_device = 0;
+  p->primary_index = dev->primary ? dev->primary->index : 1;
+  p->supports_alloc = 1;
+  p->generic_page_kind = 6;
+  p->page_kind_generation = 2;
+  p->sector_layout = 1;
+  p->supports_sync_fd = 1;
+  p->supports_semsurf = 1;
   return 0;
 }
 
@@ -104,10 +111,6 @@ static int nv_stub_dmabuf_supported(struct drm_device *dev, void *data,
                                     struct drm_file *filep) {
   return 0;
 }
-
-/* ----------------------------------------------------------------
- * DRM ioctl table
- * ---------------------------------------------------------------- */
 
 static const struct drm_ioctl_desc nv_stub_ioctls[0x10] = {
     [DRM_NVIDIA_GET_DEV_INFO] =
@@ -132,16 +135,6 @@ static const struct drm_ioctl_desc nv_stub_ioctls[0x10] = {
             .name = "NVIDIA_DMABUF_SUPPORTED",
         },
 };
-
-/* ----------------------------------------------------------------
- * DRM driver
- * ---------------------------------------------------------------- */
-
-static int nv_stub_open(struct drm_device *dev, struct drm_file *file) {
-  return 0;
-}
-
-static void nv_stub_postclose(struct drm_device *dev, struct drm_file *file) {}
 
 static const struct file_operations nv_drm_stub_fops = {
     .owner = THIS_MODULE,
@@ -170,101 +163,51 @@ static const struct drm_driver nv_drm_stub_driver = {
 };
 
 /* ----------------------------------------------------------------
- * Virtual PCI device
+ * Fake PCI-bus device
  *
- * We use a root bus + virtual PCI device so that sysfs shows:
- *   /sys/bus/pci/devices/0000:08:00.0/drm/renderD129
- * instead of:
- *   /sys/devices/platform/nvidia-drm-stub/drm/renderD129
+ * We register a plain struct device on the "pci" bus so its sysfs
+ * path becomes /sys/devices/pci<domain>:<bus>/<domain>:<bus>:<slot>.<func>
+ * instead of /sys/devices/platform/…
  *
- * The NVIDIA Vulkan ICD walks this path to determine whether it is
- * running on a discrete PCI-e GPU or a Tegra SoC.
+ * The NVIDIA ICD checks that the parent bus is NOT "platform" to
+ * decide it is on a real discrete GPU.
  * ---------------------------------------------------------------- */
 
-static struct pci_bus *stub_bus;
-static struct pci_dev *stub_pci_dev;
-static struct drm_device *stub_drm;
-
-/*
- * Fake config space.  The Vulkan ICD reads at minimum:
- *   offset 0x00 — vendor/device ID
- *   offset 0x08 — class code
- *   offset 0x2c — subsystem IDs
- */
-static int stub_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
-                         int size, u32 *val) {
-  if (PCI_SLOT(devfn) != pci_slot || PCI_FUNC(devfn) != pci_func) {
-    *val = ~0U;
-    return PCIBIOS_DEVICE_NOT_FOUND;
-  }
-
-  switch (where) {
-  case PCI_VENDOR_ID: /* 0x00 — vendor + device */
-    *val = (device_id << 16) | vendor_id;
-    break;
-  case PCI_COMMAND: /* 0x04 */
-    *val = PCI_COMMAND_MEMORY;
-    break;
-  case PCI_CLASS_REVISION: /* 0x08 — class 0x0302 = 3D controller */
-    *val = 0x03020000;
-    break;
-  case PCI_SUBSYSTEM_VENDOR_ID: /* 0x2c */
-    *val = (subsys_id << 16) | vendor_id;
-    break;
-  default:
-    *val = 0;
-    break;
-  }
-  return PCIBIOS_SUCCESSFUL;
+/* Minimal bus type — we only need a name, no match/probe logic */
+static int fake_pci_bus_match(struct device *dev,
+                              const struct device_driver *drv) {
+  return 0;
 }
 
-static int stub_pci_write(struct pci_bus *bus, unsigned int devfn, int where,
-                          int size, u32 val) {
-  return PCIBIOS_SUCCESSFUL;
-}
-
-static struct pci_ops stub_pci_ops = {
-    .read = stub_pci_read,
-    .write = stub_pci_write,
+static struct bus_type fake_pci_bus = {
+    .name = "pci", /* Must be "pci" — the ICD checks bus->name */
+    .match = fake_pci_bus_match,
 };
 
 /*
- * sysfs attributes the NVIDIA driver reads on the PCI device node.
- * Without these the ICD cannot confirm the GPU class/vendor.
+ * sysfs attributes read by the NVIDIA ICD on the device node.
+ *
+ * The ICD opens these files directly:
+ *   /sys/class/drm/renderDN/device/vendor
+ *   /sys/class/drm/renderDN/device/device
+ *   /sys/class/drm/renderDN/device/class
+ *   /sys/class/drm/renderDN/device/subsystem_vendor
+ *   /sys/class/drm/renderDN/device/subsystem_device
  */
-static ssize_t vendor_show(struct device *d, struct device_attribute *a,
-                           char *buf) {
-  return sysfs_emit(buf, "0x%04x\n", vendor_id);
-}
+#define FAKE_PCI_ATTR_SHOW(attr_name, fmt, val)                                \
+  static ssize_t attr_name##_show(struct device *d,                            \
+                                  struct device_attribute *a, char *buf) {     \
+    return sysfs_emit(buf, fmt "\n", val);                                     \
+  }                                                                            \
+  static DEVICE_ATTR_RO(attr_name)
 
-static ssize_t device_show(struct device *d, struct device_attribute *a,
-                           char *buf) {
-  return sysfs_emit(buf, "0x%04x\n", device_id);
-}
+FAKE_PCI_ATTR_SHOW(vendor, "0x%04x", vendor_id);
+FAKE_PCI_ATTR_SHOW(device, "0x%04x", device_id);
+FAKE_PCI_ATTR_SHOW(class, "0x%06x", 0x030200);
+FAKE_PCI_ATTR_SHOW(subsystem_vendor, "0x%04x", vendor_id);
+FAKE_PCI_ATTR_SHOW(subsystem_device, "0x%04x", subsys_id);
 
-static ssize_t class_show(struct device *d, struct device_attribute *a,
-                          char *buf) {
-  /* 0x030200 — PCI class "3D Controller" (NVIDIA uses this) */
-  return sysfs_emit(buf, "0x030200\n");
-}
-
-static ssize_t subsystem_vendor_show(struct device *d,
-                                     struct device_attribute *a, char *buf) {
-  return sysfs_emit(buf, "0x%04x\n", vendor_id);
-}
-
-static ssize_t subsystem_device_show(struct device *d,
-                                     struct device_attribute *a, char *buf) {
-  return sysfs_emit(buf, "0x%04x\n", subsys_id);
-}
-
-static DEVICE_ATTR_RO(vendor);
-static DEVICE_ATTR_RO(device);
-static DEVICE_ATTR_RO(class);
-static DEVICE_ATTR_RO(subsystem_vendor);
-static DEVICE_ATTR_RO(subsystem_device);
-
-static struct attribute *stub_pci_attrs[] = {
+static struct attribute *fake_pci_dev_attrs[] = {
     &dev_attr_vendor.attr,
     &dev_attr_device.attr,
     &dev_attr_class.attr,
@@ -272,104 +215,133 @@ static struct attribute *stub_pci_attrs[] = {
     &dev_attr_subsystem_device.attr,
     NULL,
 };
-
-static const struct attribute_group stub_pci_attr_group = {
-    .attrs = stub_pci_attrs,
+static const struct attribute_group fake_pci_dev_group = {
+    .attrs = fake_pci_dev_attrs,
 };
+
+static void fake_pci_dev_release(struct device *dev) {}
+
+static struct device fake_pci_dev; /* the "GPU" device */
+static struct drm_device *stub_drm;
+static bool bus_registered;
+static bool dev_registered;
+static bool attrs_added;
 
 /* ----------------------------------------------------------------
  * Module init / exit
  * ---------------------------------------------------------------- */
 
+/*
+ * We need nv_stub_open and nv_stub_postclose declared before the
+ * drm_driver struct — move them above it.
+ */
+static int nv_stub_open(struct drm_device *dev, struct drm_file *file) {
+  return 0;
+}
+
+static void nv_stub_postclose(struct drm_device *dev, struct drm_file *file) {}
+
 static int __init nv_drm_stub_init(void) {
   int ret;
-  struct pci_host_bridge *bridge;
+  char dev_name[32];
 
   /*
-   * Step 1: Allocate a fake PCI host bridge + bus.
-   * This gives us a real /sys/bus/pci/devices/XXXX:XX:XX.X entry.
+   * Step 1: Register our fake "pci" bus.
+   *
+   * We cannot reuse the real pci_bus_type here because we do not
+   * want to fight with the real PCI subsystem.  Our bus just needs
+   * the name "pci" so the ICD's bus-name check passes.
    */
-  bridge = pci_alloc_host_bridge(0);
-  if (!bridge)
-    return -ENOMEM;
-
-  bridge->dev.parent = NULL;
-  pci_set_host_bridge_release(bridge, NULL, NULL);
-
-  stub_bus =
-      pci_create_root_bus(NULL, pci_bus, &stub_pci_ops, NULL, &bridge->windows);
-  if (!stub_bus) {
-    ret = -ENOMEM;
-    goto err_bridge;
+  ret = bus_register(&fake_pci_bus);
+  if (ret) {
+    pr_err("nvidia-drm-stub: bus_register failed: %d\n", ret);
+    return ret;
   }
-
-  stub_bus->domain_nr = pci_domain;
-
-  /*
-   * Step 2: Scan the fake bus — this will call stub_pci_read()
-   * and materialise a struct pci_dev at slot:func.
-   */
-  pci_scan_child_bus(stub_bus);
-  pci_bus_add_devices(stub_bus);
+  bus_registered = true;
 
   /*
-   * Step 3: Find the pci_dev we just created.
+   * Step 2: Create the fake GPU device.
+   *
+   * Name it "<domain>:<bus>:<slot>.<func>" — exactly how the real
+   * kernel PCI core names PCI devices in sysfs.
    */
-  stub_pci_dev = pci_get_slot(stub_bus, PCI_DEVFN(pci_slot, pci_func));
-  if (!stub_pci_dev) {
-    pr_err("nvidia-drm-stub: pci_get_slot failed\n");
-    ret = -ENODEV;
-    goto err_bus;
-  }
+  snprintf(dev_name, sizeof(dev_name), "%04x:%02x:%02x.%x", pci_domain, pci_bus,
+           pci_slot, pci_func);
 
-  /*
-   * Step 4: Add the extra sysfs attributes (vendor, device, class…)
-   * that the Vulkan ICD reads directly as files.
-   */
-  ret = sysfs_create_group(&stub_pci_dev->dev.kobj, &stub_pci_attr_group);
+  device_initialize(&fake_pci_dev);
+  fake_pci_dev.bus = &fake_pci_bus;
+  fake_pci_dev.release = fake_pci_dev_release;
+
+  ret = dev_set_name(&fake_pci_dev, "%s", dev_name);
   if (ret)
-    goto err_pci_dev;
+    goto err;
+
+  ret = device_add(&fake_pci_dev);
+  if (ret) {
+    pr_err("nvidia-drm-stub: device_add failed: %d\n", ret);
+    goto err;
+  }
+  dev_registered = true;
 
   /*
-   * Step 5: Allocate and register the DRM device, parented to the
-   * fake PCI device so its sysfs path becomes:
-   *   /sys/devices/pci<domain>:<bus>/<domain>:<bus>:<slot>.<func>/drm/renderD*
+   * Step 3: Add the PCI sysfs attributes the ICD reads as plain files.
    */
-  stub_drm = drm_dev_alloc(&nv_drm_stub_driver, &stub_pci_dev->dev);
+  ret = sysfs_create_group(&fake_pci_dev.kobj, &fake_pci_dev_group);
+  if (ret) {
+    pr_err("nvidia-drm-stub: sysfs_create_group failed: %d\n", ret);
+    goto err;
+  }
+  attrs_added = true;
+
+  /*
+   * Step 4: Allocate and register the DRM device, parented to our
+   * fake PCI device.  This makes the renderD* node appear at:
+   *   /sys/devices/pci<domain>:<bus>/<domain>:<bus>:<slot>.<func>/drm/renderD*
+   * and
+   *   /sys/class/drm/renderD* → .../renderD*/
+      device → fake_pci_dev * /
+      stub_drm = drm_dev_alloc(&nv_drm_stub_driver, &fake_pci_dev);
   if (IS_ERR(stub_drm)) {
     ret = PTR_ERR(stub_drm);
-    goto err_sysfs;
+    pr_err("nvidia-drm-stub: drm_dev_alloc failed: %d\n", ret);
+    goto err;
   }
 
   ret = drm_dev_register(stub_drm, 0);
-  if (ret)
-    goto err_drm;
+  if (ret) {
+    pr_err("nvidia-drm-stub: drm_dev_register failed: %d\n", ret);
+    drm_dev_put(stub_drm);
+    stub_drm = NULL;
+    goto err;
+  }
 
-  pr_info("nvidia-drm-stub: registered renderD%d under PCI %04x:%02x:%02x.%x\n",
-          stub_drm->render ? stub_drm->render->index : -1, pci_domain, pci_bus,
-          pci_slot, pci_func);
-
+  pr_info("nvidia-drm-stub: registered renderD%d under %s\n",
+          stub_drm->render ? stub_drm->render->index : -1, dev_name);
   return 0;
 
-err_drm:
-  drm_dev_put(stub_drm);
-err_sysfs:
-  sysfs_remove_group(&stub_pci_dev->dev.kobj, &stub_pci_attr_group);
-err_pci_dev:
-  pci_dev_put(stub_pci_dev);
-err_bus:
-  pci_remove_root_bus(stub_bus);
-err_bridge:
-  /* bridge is freed by pci_remove_root_bus / pci_free_host_bridge */
+err:
+  if (attrs_added)
+    sysfs_remove_group(&fake_pci_dev.kobj, &fake_pci_dev_group);
+  if (dev_registered)
+    device_del(&fake_pci_dev);
+  put_device(&fake_pci_dev);
+  if (bus_registered)
+    bus_unregister(&fake_pci_bus);
   return ret;
 }
 
 static void __exit nv_drm_stub_exit(void) {
-  drm_dev_unregister(stub_drm);
-  drm_dev_put(stub_drm);
-  sysfs_remove_group(&stub_pci_dev->dev.kobj, &stub_pci_attr_group);
-  pci_dev_put(stub_pci_dev);
-  pci_remove_root_bus(stub_bus);
+  if (stub_drm) {
+    drm_dev_unregister(stub_drm);
+    drm_dev_put(stub_drm);
+  }
+  if (attrs_added)
+    sysfs_remove_group(&fake_pci_dev.kobj, &fake_pci_dev_group);
+  if (dev_registered)
+    device_del(&fake_pci_dev);
+  put_device(&fake_pci_dev);
+  if (bus_registered)
+    bus_unregister(&fake_pci_bus);
 }
 
 module_init(nv_drm_stub_init);
